@@ -4,24 +4,23 @@ use crate::config::{Config, save_config};
 use crate::commands::BackendCommand;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{error, info, warn, debug};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use sysinfo::System;
-use std::path::PathBuf;
-
 
 // Simplified response structures
 #[derive(Serialize)]
 struct CommandResult<'a> {
+    r#type: &'a str,
     command_id: &'a str,
     success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,16 +29,34 @@ struct CommandResult<'a> {
 
 #[derive(Serialize)]
 struct StatusReport<'a, S: Serialize> {
+    r#type: &'a str,
     command_id: &'a str,
     status: S,
 }
 
+#[derive(Serialize)]
+struct RegistrationRequest {
+    requested_max_gib: u64,
+    system_info: SystemInfo,
+}
+
+#[derive(Serialize)]
+struct SystemInfo {
+    hostname: String,
+    os_version: String,
+}
+
+#[derive(Deserialize)]
+struct RegistrationResponse {
+    node_id: String,
+    auth_token: String,
+}
 
 pub struct Network {
     backend_ws_url: String,
     auth_token: String,
     node_id: String,
-    command_sender: mpsc::Sender<BackendCommand>, // Corrected type
+    command_sender: mpsc::Sender<BackendCommand>,
 }
 
 impl Network {
@@ -47,7 +64,7 @@ impl Network {
         backend_ws_url: String,
         auth_token: String,
         node_id: String,
-        command_sender: mpsc::Sender<BackendCommand>, // Corrected type
+        command_sender: mpsc::Sender<BackendCommand>,
     ) -> Self {
         Self {
             backend_ws_url,
@@ -58,10 +75,9 @@ impl Network {
     }
 
     pub async fn run_connection_loop(&self, mut outgoing_responses_rx: mpsc::Receiver<Message>) -> Result<()> {
-        let mut attempts = 0;
+        let mut attempts: u64 = 0;
         let base_delay_ms = 1000;
-        let max_delay_ms = 60000; // 1 minute
-        const MAX_CONNECTION_ATTEMPTS: u32 = 10;
+        let max_delay_ms = 60000;
 
         loop {
             info!("Attempting to connect to WebSocket: {}. Attempt #{}", self.backend_ws_url, attempts + 1);
@@ -69,28 +85,25 @@ impl Network {
             match self.establish_and_process_messages(&mut outgoing_responses_rx).await {
                 Ok(_) => {
                     info!("WebSocket connection closed gracefully or stream ended. Re-attempting connection.");
-                    attempts = 0; // Reset attempts on graceful close before retry
+                    attempts = 0;
                 }
                 Err(e) => {
                     error!("WebSocket connection error: {:#}", e);
                     attempts += 1;
-                    if attempts >= MAX_CONNECTION_ATTEMPTS {
-                        error!("Maximum reconnection attempts ({}) reached. Giving up.", MAX_CONNECTION_ATTEMPTS);
-                        return Err(e.context(format!("Failed to connect after {} attempts", MAX_CONNECTION_ATTEMPTS)));
-                    }
                 }
             }
 
-            let delay_ms = std::cmp::min(base_delay_ms * 2_u64.pow(attempts.saturating_sub(1)), max_delay_ms);
+            let delay_ms = std::cmp::min(base_delay_ms * 2_u64.pow(attempts.saturating_sub(1) as u32), max_delay_ms);
             info!("Retrying connection in {}ms...", delay_ms);
             sleep(Duration::from_millis(delay_ms)).await;
         }
     }
 
     async fn establish_and_process_messages(&self, outgoing_responses_rx: &mut mpsc::Receiver<Message>) -> Result<()> {
-        let (ws_stream, _) = connect_async(&self.backend_ws_url)
+        let (ws_stream, response) = connect_async(&self.backend_ws_url)
             .await
             .with_context(|| format!("Failed to connect to backend WebSocket: {}", self.backend_ws_url))?;
+        debug!("WebSocket handshake response: {:?}", response);
         info!("Successfully connected to backend WebSocket: {}", self.backend_ws_url);
 
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -110,7 +123,7 @@ impl Network {
         const AUTH_TIMEOUT_SECONDS: u64 = 10;
         match timeout(Duration::from_secs(AUTH_TIMEOUT_SECONDS), ws_receiver.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
-                match serde_json::from_str::<serde_json::Value>(&text) { // Use Value for flexible auth response
+                match serde_json::from_str::<serde_json::Value>(&text) {
                     Ok(response) => {
                         if response.get("type").and_then(serde_json::Value::as_str) == Some("AUTH_SUCCESS") {
                             info!("Authentication successful.");
@@ -123,10 +136,11 @@ impl Network {
             }
             Ok(Some(Ok(other_msg))) => return Err(anyhow!("Unexpected message type during auth: {:?}", other_msg)),
             Ok(Some(Err(e))) => return Err(anyhow::Error::from(e)).context("Error waiting for auth response"),
+            #[allow(non_snake_case)]
             Ok(None) => return Err(anyhow!("Connection closed by peer before auth response")),
             Err(_) => return Err(anyhow!("Timed out waiting for auth response after {} seconds", AUTH_TIMEOUT_SECONDS)),
         }
-        
+
         // Message Handling Loop
         loop {
             tokio::select! {
@@ -135,65 +149,62 @@ impl Network {
                         Ok(message) => {
                             match message {
                                 Message::Text(text) => {
+                                    debug!("Received Text: {}", text);
                                     if let Err(e) = self.process_message(text).await {
                                         error!("Error processing incoming message: {}", e);
-                                        // Decide if this error should terminate the connection or just log
                                     }
                                 }
                                 Message::Binary(_) => warn!("Received binary message, which is not currently processed."),
                                 Message::Ping(ping_data) => {
-                                    info!("Received Ping, sending Pong.");
+                                    debug!("Received Ping, sending Pong.");
                                     if let Err(e) = ws_sender.send(Message::Pong(ping_data)).await {
                                         error!("Failed to send Pong: {}", e);
-                                        return Err(e.into()); // Critical error, terminate
+                                        return Err(e.into());
                                     }
                                 }
-                                Message::Pong(_) => info!("Received Pong from server."),
+                                Message::Pong(_) => debug!("Received Pong from server."),
                                 Message::Close(close_frame) => {
                                     info!("WebSocket connection closed by peer: {:?}", close_frame);
-                                    return Ok(()); // Graceful close, will trigger reconnect by run_connection_loop
+                                    return Ok(()); 
                                 }
-                                Message::Frame(_) => { /* Usually not handled at this level */ }
+                                Message::Frame(_) => {}
                             }
                         }
                         Err(e) => {
                             error!("WebSocket receive error: {}", e);
-                            return Err(e.into()); // Propagate error to trigger reconnection logic.
+                            return Err(e.into());
                         }
                     }
                 }
                 Some(response_to_send) = outgoing_responses_rx.recv() => {
+                    debug!("Sending message: {:?}", response_to_send);
                     if let Err(e) = ws_sender.send(response_to_send).await {
                         error!("Failed to send outgoing response via WebSocket: {}", e);
-                        return Err(e.into()); // Critical error, terminate
-                    } else {
-                        // info!("Successfully sent response to backend."); // Can be verbose
+                        return Err(e.into());
                     }
                 }
                 else => {
                     info!("WebSocket receiver stream ended or outgoing_responses_rx closed. Terminating current connection processing.");
-                    return Ok(()); // Will trigger reconnect
+                    return Ok(());
                 }
             }
         }
     }
 
     async fn process_message(&self, message_text: String) -> Result<()> {
-        // info!("Processing message: {}", message_text); // Can be verbose
         match serde_json::from_str::<BackendCommand>(&message_text) {
             Ok(command) => {
-                // info!("Parsed command: {:?}", command); // Can be verbose
+                debug!("Parsed command: {:?}", command);
                 if let Err(e) = self.command_sender.send(command).await {
                     error!("Failed to send parsed command to internal channel: {}. Channel might be closed.", e);
-                    // This could be a critical error if the command handler task has panicked.
-                    // Depending on design, might want to return Err(e.into()) here.
+                    return Err(e.into());
                 }
             }
             Err(e) => {
                 error!("Failed to parse incoming message as BackendCommand: {}. Message: '{}'", e, message_text);
-                // Send an Unknown command to the handler to acknowledge receipt but indicate parsing failure.
-                let unknown_command = BackendCommand::Unknown; // Assuming BackendCommand has an Unknown variant
-                if let Err(send_err) = self.command_sender.send(unknown_command).await {
+                // Optionally send a 'PARSE_ERROR' response to the backend if desired.
+                // For now, send Unknown to log internally.
+                if let Err(send_err) = self.command_sender.send(BackendCommand::Unknown).await {
                     error!("Failed to send Unknown command to internal channel: {}", send_err);
                 }
             }
@@ -202,30 +213,12 @@ impl Network {
     }
 }
 
-// Define structs for registration request and response
-#[derive(Serialize)]
-struct RegistrationRequest {
-    requested_max_gib: u64,
-    system_info: SystemInfo,
-}
-
-#[derive(Serialize)]
-struct SystemInfo {
-    hostname: String,
-    os_version: String,
-}
-
-#[derive(Deserialize)]
-struct RegistrationResponse {
-    node_id: String,
-    auth_token: String,
-}
 
 async fn register_node(config: &mut Config, http_client: &HttpClient) -> Result<()> {
     info!("Node ID or Auth Token is missing. Starting registration process.");
 
     let mut sys = System::new_all();
-    sys.refresh_all();
+    sys.refresh_all(); // Make sure data is up-to-date
 
     let system_info = SystemInfo {
         hostname: System::host_name().unwrap_or_else(|| "unknown_hostname".to_string()),
@@ -273,6 +266,7 @@ pub async fn send_command_result(
     operation_result: Result<()>,
 ) -> Result<()> {
     let response = CommandResult {
+        r#type: "COMMAND_RESULT",
         command_id: &command_id,
         success: operation_result.is_ok(),
         error: operation_result.err().map(|e| e.to_string()),
@@ -280,7 +274,7 @@ pub async fn send_command_result(
 
     let response_text = serde_json::to_string(&response)
         .context("Failed to serialize command result")?;
-    
+
     response_tx.send(Message::Text(response_text)).await
         .context("Failed to send command result")?;
     Ok(())
@@ -292,60 +286,60 @@ pub async fn send_status_report<S: Serialize>(
     status_data: S,
 ) -> Result<()> {
     let response = StatusReport {
+        r#type: "STATUS_REPORT",
         command_id: &command_id,
         status: status_data,
     };
-    
+
     let response_text = serde_json::to_string(&response)
         .context("Failed to serialize status report")?;
-    
+
     response_tx.send(Message::Text(response_text)).await
         .context("Failed to send status report")?;
     Ok(())
 }
 
-pub async fn start_communication_loop(initial_config: &Config, used_space_bytes: Arc<AtomicU64>, max_storage_bytes: Arc<AtomicU64>, chunk_count: Arc<AtomicU64>) -> Result<()> {
-    let mut current_config = initial_config.clone();
+pub async fn start_communication_loop(
+    mut config: Config, // Take ownership to allow mutation during registration
+    used_space_bytes: Arc<AtomicU64>,
+    max_storage_bytes: Arc<AtomicU64>,
+    chunk_count: Arc<AtomicU64>,
+) -> Result<()> {
     let http_client = HttpClient::new();
 
-    if current_config.node_id.is_empty() || current_config.auth_token.is_empty() {
-        register_node(&mut current_config, &http_client)
+    // Register if needed (mutates config)
+    if config.node_id.is_empty() || config.auth_token.is_empty() {
+        register_node(&mut config, &http_client)
             .await
             .context("Node registration process failed")?;
     } else {
         info!("Node ID and Auth Token found in config.");
     }
 
-    if !tokio::fs::try_exists(&current_config.storage_path).await.unwrap_or(false) {
-        info!("Storage path {} does not exist. Creating it.", current_config.storage_path.display());
-        fs::create_dir_all(&current_config.storage_path)
-            .await
-            .with_context(|| format!("Failed to create storage directory: {}", current_config.storage_path.display()))?;
-        info!("Storage path {} created.", current_config.storage_path.display());
-    } else {
-        info!("Storage path {} already exists.", current_config.storage_path.display());
-    }
-
+    // Create channels for communication
     let (backend_command_tx, mut backend_command_rx) = mpsc::channel::<BackendCommand>(32);
     let (outgoing_responses_tx, outgoing_responses_rx) = mpsc::channel::<Message>(32);
 
+    // Initialize Network struct with potentially updated config
     let network = Network::init(
-        current_config.backend_ws_url.clone(),
-        current_config.auth_token.clone(),
-        current_config.node_id.clone(),
+        config.backend_ws_url.clone(),
+        config.auth_token.clone(),
+        config.node_id.clone(),
         backend_command_tx,
     );
 
-    let storage_path_clone: PathBuf = current_config.storage_path.clone();
+    // Clone necessary items for the command handler task
+    let storage_path_clone: PathBuf = config.storage_path.clone();
     let responses_tx_clone = outgoing_responses_tx.clone();
     let handler_used_space = used_space_bytes.clone();
     let handler_max_space = max_storage_bytes.clone();
     let handler_chunk_count = chunk_count.clone();
 
+    // Spawn the command handler task
     tokio::spawn(async move {
         info!("Command handler task started.");
         while let Some(command) = backend_command_rx.recv().await {
-            // info!("Command handler received: {:?}", command); // Can be verbose
+            debug!("Command handler received: {:?}", command);
             if let Err(e) = crate::commands::handle_command(
                 command,
                 storage_path_clone.clone(),
@@ -357,11 +351,12 @@ pub async fn start_communication_loop(initial_config: &Config, used_space_bytes:
             .await
             {
                 error!("Error handling command: {:?}", e);
+                // Optionally send an error response back if possible/needed
             }
         }
         info!("Command handler task finished (backend_command_rx channel closed).");
     });
 
+    // Run the main network connection loop
     network.run_connection_loop(outgoing_responses_rx).await
 }
-
