@@ -1,0 +1,17 @@
+node_id = ""
+
+auth_token = ""
+
+backend_api_url = ""
+
+backend_ws_url = ""
+
+storage_path = "/var/lib/cloud_storage_node"
+
+max_storage_gib = 20
+
+log_level = "info"
+
+check_interval_seconds = 60
+
+recalibration_interval_seconds = 3600
