@@ -67,11 +67,9 @@ async fn main() -> Result<()> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&log_level)).init();
 
-    // 2. Load configuration (or handle error)
+    // Load configuration
     let config = initial_config_result.context("Failed to load configuration")?;
-    info!("Configuration loaded."); // Avoid logging the config itself
 
-    // 3. Ensure storage path exists BEFORE checking disk space
     info!("Ensuring storage path exists: {:?}", config.storage_path);
     fs::create_dir_all(&config.storage_path)
         .await
