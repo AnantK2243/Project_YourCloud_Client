@@ -1,8 +1,0 @@
-/home/anantk/Documents/project_unknown/storage_client/target/debug/deps/libanstyle_query-d5bde24fe954d2e9.rmeta: /home/anantk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anstyle-query-1.1.2/src/lib.rs /home/anantk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anstyle-query-1.1.2/src/windows.rs
-
-/home/anantk/Documents/project_unknown/storage_client/target/debug/deps/libanstyle_query-d5bde24fe954d2e9.rlib: /home/anantk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anstyle-query-1.1.2/src/lib.rs /home/anantk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anstyle-query-1.1.2/src/windows.rs
-
-/home/anantk/Documents/project_unknown/storage_client/target/debug/deps/anstyle_query-d5bde24fe954d2e9.d: /home/anantk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anstyle-query-1.1.2/src/lib.rs /home/anantk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anstyle-query-1.1.2/src/windows.rs
-
-/home/anantk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anstyle-query-1.1.2/src/lib.rs:
-/home/anantk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anstyle-query-1.1.2/src/windows.rs:
