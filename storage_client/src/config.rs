@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use dirs;
 use tokio::fs;
+use std::env; // Added for environment variable access
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -21,12 +22,27 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let default_storage_path = dirs::home_dir()
+            .map(|mut path| {
+                path.push("cloud_storage_node");
+                path
+            })
+            .or_else(|| {
+                env::var("USER")
+                    .ok()
+                    .map(|user_name| PathBuf::from(format!("/home/{}/cloud_storage_node", user_name)))
+            })
+            .unwrap_or_else(|| {
+                log::warn!("Could not determine home directory or USER env var. Defaulting storage_path to relative 'cloud_storage_node_data'.");
+                PathBuf::from("cloud_storage_node_data") 
+            });
+
         Self {
             node_id: String::new(),
             auth_token: String::new(),
             backend_api_url: "".to_string(),
             backend_ws_url: "".to_string(),
-            storage_path: PathBuf::from("/var/lib/cloud_storage_node"),
+            storage_path: default_storage_path,
             max_storage_gib: 20,
             log_level: "info".to_string(),
             check_interval_seconds: 60,
@@ -44,6 +60,8 @@ pub async fn load_config() -> Result<Config> {
         save_config(&default_config).await?;
         return Ok(default_config);
     }
+
+    log::info!("Config found: {:?}", config_path);
 
     let config_content = fs::read_to_string(&config_path).await
         .context("Failed to read config file")?;
@@ -79,7 +97,7 @@ fn get_config_path() -> Result<PathBuf> {
 
 fn validate_config(config: &Config) -> Result<()> {
     if !config.storage_path.is_absolute() {
-        return Err(anyhow::anyhow!("storage_path must be an absolute path"));
+        return Err(anyhow::anyhow!("storage_path must be an absolute path. Current: {:?}", config.storage_path));
     }
     if config.max_storage_gib <= 0 {
         return Err(anyhow::anyhow!("max_storage_gib must be greater than 0"));
