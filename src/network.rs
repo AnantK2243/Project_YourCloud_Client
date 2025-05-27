@@ -17,7 +17,6 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use sysinfo::System;
 
-// Simplified response structures
 #[derive(Serialize)]
 struct CommandResult<'a> {
     r#type: &'a str,
@@ -36,7 +35,7 @@ struct StatusReport<'a, S: Serialize> {
 
 #[derive(Serialize)]
 struct RegistrationRequest {
-    requested_max_gib: u64,
+    available_max_gib: u64,
     system_info: SystemInfo,
 }
 
@@ -120,15 +119,16 @@ impl Network {
             .context("Failed to send authentication message")?;
         info!("Authentication message sent.");
 
+        // Timeout Auth if it takes to long
         const AUTH_TIMEOUT_SECONDS: u64 = 10;
         match timeout(Duration::from_secs(AUTH_TIMEOUT_SECONDS), ws_receiver.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
                 match serde_json::from_str::<serde_json::Value>(&text) {
-                    Ok(response) => {
-                        if response.get("type").and_then(serde_json::Value::as_str) == Some("AUTH_SUCCESS") {
+                    Ok(response_val) => {
+                        if response_val.get("type").and_then(serde_json::Value::as_str) == Some("AUTH_SUCCESS") {
                             info!("Authentication successful.");
                         } else {
-                            return Err(anyhow!("Authentication failed: {:?}", response));
+                            return Err(anyhow!("Authentication failed: {:?}", response_val));
                         }
                     }
                     Err(e) => return Err(anyhow!(e)).context("Failed to parse auth response JSON"),
@@ -148,12 +148,15 @@ impl Network {
                     match message_result {
                         Ok(message) => {
                             match message {
-                                Message::Text(text) => {
-                                    debug!("Received Text: {}", text);
-                                    if let Err(e) = self.process_message(text).await {
+                                // Process command recieved
+                                Message::Text(command) => {
+                                    debug!("Received Command: {}", command);
+                                    if let Err(e) = self.process_message(command).await {
                                         error!("Error processing incoming message: {}", e);
                                     }
                                 }
+
+                                // Other possible responses, not usual for use
                                 Message::Binary(_) => warn!("Received binary message, which is not currently processed."),
                                 Message::Ping(ping_data) => {
                                     debug!("Received Ping, sending Pong.");
@@ -165,7 +168,7 @@ impl Network {
                                 Message::Pong(_) => debug!("Received Pong from server."),
                                 Message::Close(close_frame) => {
                                     info!("WebSocket connection closed by peer: {:?}", close_frame);
-                                    return Ok(()); 
+                                    return Ok(());
                                 }
                                 Message::Frame(_) => {}
                             }
@@ -176,6 +179,8 @@ impl Network {
                         }
                     }
                 }
+
+                // Reply with command status
                 Some(response_to_send) = outgoing_responses_rx.recv() => {
                     debug!("Sending message: {:?}", response_to_send);
                     if let Err(e) = ws_sender.send(response_to_send).await {
@@ -202,8 +207,6 @@ impl Network {
             }
             Err(e) => {
                 error!("Failed to parse incoming message as BackendCommand: {}. Message: '{}'", e, message_text);
-                // Optionally send a 'PARSE_ERROR' response to the backend if desired.
-                // For now, send Unknown to log internally.
                 if let Err(send_err) = self.command_sender.send(BackendCommand::Unknown).await {
                     error!("Failed to send Unknown command to internal channel: {}", send_err);
                 }
@@ -213,6 +216,37 @@ impl Network {
     }
 }
 
+// Public functions to be called by commands::handle_command to send responses
+pub async fn send_command_result(response_tx: &mpsc::Sender<Message>, command_id: String, operation_result: Result<()>) -> Result<()> {
+    let response = CommandResult {
+        r#type: "COMMAND_RESULT",
+        command_id: &command_id,
+        success: operation_result.is_ok(),
+        error: operation_result.err().map(|e| e.to_string()),
+    };
+
+    let response_text = serde_json::to_string(&response)
+        .context("Failed to serialize command result")?;
+
+    response_tx.send(Message::Text(response_text)).await
+        .context("Failed to send command result")?;
+    Ok(())
+}
+
+pub async fn send_status_report<S: Serialize>(response_tx: &mpsc::Sender<Message>, command_id: String, status_data: S) -> Result<()> {
+    let response = StatusReport {
+        r#type: "STATUS_REPORT",
+        command_id: &command_id,
+        status: status_data,
+    };
+
+    let response_text = serde_json::to_string(&response)
+        .context("Failed to serialize status report")?;
+
+    response_tx.send(Message::Text(response_text)).await
+        .context("Failed to send status report")?;
+    Ok(())
+}
 
 async fn register_node(config: &mut Config, http_client: &HttpClient) -> Result<()> {
     info!("Node ID or Auth Token is missing. Starting registration process.");
@@ -220,19 +254,25 @@ async fn register_node(config: &mut Config, http_client: &HttpClient) -> Result<
     let mut sys = System::new_all();
     sys.refresh_all(); // Make sure data is up-to-date
 
+    // Get system info for storage location information
     let system_info = SystemInfo {
         hostname: System::host_name().unwrap_or_else(|| "unknown_hostname".to_string()),
         os_version: System::long_os_version().unwrap_or_else(|| "unknown_os_version".to_string()),
     };
 
+    // Create payload
     let registration_payload = RegistrationRequest {
-        requested_max_gib: config.max_storage_gib,
+        available_max_gib: config.max_storage_gib,
         system_info,
     };
 
-    let registration_url = format!("{}/register_node", config.backend_api_url);
+    let backend_api_url = config.backend_api_url.clone();
+
+    // Generate api endpoint
+    let registration_url = format!("{}/register_node", backend_api_url);
     info!("Registering node with backend: {}", registration_url);
 
+    // Send the payload and wait for response
     let response = http_client
         .post(&registration_url)
         .json(&registration_payload)
@@ -249,8 +289,10 @@ async fn register_node(config: &mut Config, http_client: &HttpClient) -> Result<
         info!("Successfully registered with backend. Node ID: {}", reg_response.node_id);
         config.node_id = reg_response.node_id;
         config.auth_token = reg_response.auth_token;
+        // Update the config's backend_api_url if it was changed
+        config.backend_api_url = backend_api_url;
         save_config(config).await.context("Failed to save updated config after registration")?;
-        info!("Configuration updated with new Node ID and Auth Token.");
+        info!("Configuration updated with new Node ID, Auth Token, and potentially upgraded API URL.");
         Ok(())
     } else {
         let error_body = response.text().await.unwrap_or_else(|_| "No error body".to_string());
@@ -259,55 +301,30 @@ async fn register_node(config: &mut Config, http_client: &HttpClient) -> Result<
     }
 }
 
-// Public functions to be called by commands::handle_command to send responses
-pub async fn send_command_result(
-    response_tx: &mpsc::Sender<Message>,
-    command_id: String,
-    operation_result: Result<()>,
-) -> Result<()> {
-    let response = CommandResult {
-        r#type: "COMMAND_RESULT",
-        command_id: &command_id,
-        success: operation_result.is_ok(),
-        error: operation_result.err().map(|e| e.to_string()),
-    };
 
-    let response_text = serde_json::to_string(&response)
-        .context("Failed to serialize command result")?;
-
-    response_tx.send(Message::Text(response_text)).await
-        .context("Failed to send command result")?;
-    Ok(())
-}
-
-pub async fn send_status_report<S: Serialize>(
-    response_tx: &mpsc::Sender<Message>,
-    command_id: String,
-    status_data: S,
-) -> Result<()> {
-    let response = StatusReport {
-        r#type: "STATUS_REPORT",
-        command_id: &command_id,
-        status: status_data,
-    };
-
-    let response_text = serde_json::to_string(&response)
-        .context("Failed to serialize status report")?;
-
-    response_tx.send(Message::Text(response_text)).await
-        .context("Failed to send status report")?;
-    Ok(())
-}
-
-pub async fn start_communication_loop(
-    mut config: Config, // Take ownership to allow mutation during registration
-    used_space_bytes: Arc<AtomicU64>,
-    max_storage_bytes: Arc<AtomicU64>,
-    chunk_count: Arc<AtomicU64>,
-) -> Result<()> {
+pub async fn start_communication_loop(mut config: Config, used_space_bytes: Arc<AtomicU64>, max_storage_bytes: Arc<AtomicU64>, chunk_count: Arc<AtomicU64>) -> Result<()> {
     let http_client = HttpClient::new();
 
-    // Register if needed (mutates config)
+    // Ensure backend_ws_url uses WSS
+    if config.backend_ws_url.starts_with("ws://") {
+        warn!("Configured backend_ws_url uses WS. Automatically upgrading to WSS for security: {}", config.backend_ws_url);
+        config.backend_ws_url = config.backend_ws_url.replace("ws://", "wss://");
+    } else if !config.backend_ws_url.starts_with("wss://") {
+        warn!("Configured backend_ws_url does not specify a scheme. Assuming WSS: {}", config.backend_ws_url);
+        config.backend_ws_url = format!("wss://{}", config.backend_ws_url);
+    }
+
+    // Ensure backend_api_url uses HTTPS
+    if config.backend_api_url.starts_with("http://") {
+        warn!("Configured backend_api_url uses HTTP. Automatically upgrading to HTTPS for security: {}", config.backend_api_url);
+        config.backend_api_url = config.backend_api_url.replace("http://", "https://");
+    } else if !config.backend_api_url.starts_with("https://") {
+        warn!("Configured backend_api_url does not specify a scheme. Assuming HTTPS: {}", config.backend_api_url);
+        config.backend_api_url = format!("https://{}", config.backend_api_url);
+    }
+
+
+    // Register if needed (may mutate config)
     if config.node_id.is_empty() || config.auth_token.is_empty() {
         register_node(&mut config, &http_client)
             .await
@@ -351,7 +368,6 @@ pub async fn start_communication_loop(
             .await
             {
                 error!("Error handling command: {:?}", e);
-                // Optionally send an error response back if possible/needed
             }
         }
         info!("Command handler task finished (backend_command_rx channel closed).");
