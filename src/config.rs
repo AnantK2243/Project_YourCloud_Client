@@ -24,13 +24,13 @@ impl Default for Config {
     fn default() -> Self {
         let default_storage_path = dirs::home_dir()
             .map(|mut path| {
-                path.push("cloud_storage_node");
+                path.push("Project_YourCloud");
                 path
             })
             .or_else(|| {
                 env::var("USER")
                     .ok()
-                    .map(|user_name| PathBuf::from(format!("/home/{}/cloud_storage_node", user_name)))
+                    .map(|user_name| PathBuf::from(format!("/home/{}/Project_YourCloud", user_name)))
             })
             .unwrap_or_else(|| {
                 log::warn!("Could not determine home directory or USER env var. Defaulting storage_path to relative 'cloud_storage_node_data'.");
@@ -89,8 +89,8 @@ pub async fn save_config(config: &Config) -> Result<()> {
 
 fn get_config_path() -> Result<PathBuf> {
     let config_path = dirs::config_dir()
-        .map(|dir| dir.join("storage_client").join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from("/etc/storage_client/config.toml"));
+        .map(|dir| dir.join("Project_YourCloud").join("config.toml"))
+        .unwrap_or_else(|| PathBuf::from("/etc/Project_YourCloud/config.toml"));
     
     Ok(config_path)
 }
