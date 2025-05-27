@@ -22,6 +22,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        // Generate default user storage folder
         let default_storage_path = dirs::home_dir()
             .map(|mut path| {
                 path.push("Project_YourCloud");
@@ -33,8 +34,11 @@ impl Default for Config {
                     .map(|user_name| PathBuf::from(format!("/home/{}/Project_YourCloud", user_name)))
             })
             .unwrap_or_else(|| {
-                log::warn!("Could not determine home directory or USER env var. Defaulting storage_path to relative 'cloud_storage_node_data'.");
-                PathBuf::from("cloud_storage_node_data") 
+                // Dump to working directory
+                log::warn!("Could not determine home directory or USER env var. Defaulting storage_path to current directory + 'Project_YourCloud'.");
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                    .join("Project_YourCloud")
             });
 
         Self {
@@ -52,17 +56,22 @@ impl Default for Config {
 }
 
 pub async fn load_config() -> Result<Config> {
-    let config_path =get_config_path()?;
+    let config_path = get_config_path()?;
     
+    // First time run, create default config file at path
     if !config_path.exists() {
         log::info!("Config file not found, creating default at: {:?}", config_path);
         let default_config = Config::default();
         save_config(&default_config).await?;
+
+        // Return default config
         return Ok(default_config);
     }
 
     log::info!("Config found: {:?}", config_path);
 
+
+    // Read and return
     let config_content = fs::read_to_string(&config_path).await
         .context("Failed to read config file")?;
 
@@ -88,6 +97,7 @@ pub async fn save_config(config: &Config) -> Result<()> {
 }
 
 fn get_config_path() -> Result<PathBuf> {
+    // Return default user config path or store in /etc directory
     let config_path = dirs::config_dir()
         .map(|dir| dir.join("Project_YourCloud").join("config.toml"))
         .unwrap_or_else(|| PathBuf::from("/etc/Project_YourCloud/config.toml"));
@@ -96,9 +106,12 @@ fn get_config_path() -> Result<PathBuf> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
+    // Non-absolute Path
     if !config.storage_path.is_absolute() {
         return Err(anyhow::anyhow!("storage_path must be an absolute path. Current: {:?}", config.storage_path));
     }
+
+    // Config storage misconfigured
     if config.max_storage_gib <= 0 {
         return Err(anyhow::anyhow!("max_storage_gib must be greater than 0"));
     }

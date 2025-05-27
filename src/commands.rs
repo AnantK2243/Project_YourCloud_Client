@@ -17,28 +17,25 @@ pub enum BackendCommand {
     RetrieveChunk { command_id: String, chunk_id: String, upload_destination_url: String },
     DeleteChunk { command_id: String, chunk_id: String },
     QueryStatus { command_id: String },
-    #[serde(other)] // Catch anything else
+    #[serde(other)] // Error Out Unrecognized commands
     Unknown,
 }
 
-pub async fn handle_command(
-    command: BackendCommand,
-    storage_path: std::path::PathBuf,
-    response_tx: mpsc::Sender<Message>,
-    current_used_space_bytes: Arc<AtomicU64>,
-    max_storage_bytes: Arc<AtomicU64>,
-    current_chunk_count: Arc<AtomicU64>,
-) -> Result<()> {
-    let http_client = HttpClient::new(); // Create one client per handler run or share one via Arc
+pub async fn handle_command(command: BackendCommand, storage_path: std::path::PathBuf, response_tx: mpsc::Sender<Message>, current_used_space_bytes: Arc<AtomicU64>, max_storage_bytes: Arc<AtomicU64>, current_chunk_count: Arc<AtomicU64>) -> Result<()> {
+    let http_client = HttpClient::new();
 
     match command {
+        // Add file to store
         BackendCommand::StoreChunk { command_id, chunk_id, expected_size_bytes, data_source_url } => {
             log::info!("Handling StoreChunk: {}", chunk_id);
 
+            // Get the data from download link
             let download_result = http_client.get(&data_source_url).send().await;
 
+            // Parse result of call
             let result = match download_result {
                 Ok(response) if response.status().is_success() => {
+                    // Store the chunk to store
                     let data_stream = response.bytes_stream();
                     storage::store_chunk_to_disk(
                         &storage_path,
@@ -48,7 +45,7 @@ pub async fn handle_command(
                         &current_used_space_bytes,
                         &max_storage_bytes,
                         &current_chunk_count
-                    ).await.map(|_| ()) // Map successful u64 to Ok(())
+                    ).await.map(|_| ())
                 }
                 Ok(response) => Err(anyhow!("Download failed with status: {}", response.status())),
                 Err(e) => Err(anyhow!("Download request failed: {}", e)),
@@ -57,12 +54,14 @@ pub async fn handle_command(
             send_result(&response_tx, command_id, result).await?;
         },
 
+        // Get file from store
         BackendCommand::RetrieveChunk { command_id, chunk_id, upload_destination_url } => {
             log::info!("Handling RetrieveChunk: {}", chunk_id);
 
+            // Get the required chunk from store
             let result = match storage::retrieve_chunk_from_disk(&storage_path, &chunk_id).await {
                 Ok(stream) => {
-                    // ** FIX: Stream the upload **
+                    // Upload the file to requested link
                     let body = reqwest::Body::wrap_stream(stream);
                     http_client.put(&upload_destination_url)
                         .body(body)
@@ -78,47 +77,53 @@ pub async fn handle_command(
                             }
                         })
                 }
-                Err(e) => Err(e), // Propagate error from retrieve_chunk_from_disk
+                Err(e) => Err(e),
             };
 
             send_result(&response_tx, command_id, result).await?;
         },
 
+        // Remove file from store
         BackendCommand::DeleteChunk { command_id, chunk_id } => {
             log::info!("Handling DeleteChunk: {}", chunk_id);
 
+            // Delete the chunk_id node from store
             let result = storage::delete_chunk_from_disk(
                 &storage_path,
                 &chunk_id,
                 &current_used_space_bytes,
                 &current_chunk_count
-            ).await.map(|_| ()); // Map Ok(Some(_)) and Ok(None) both to Ok(()) as deletion is 'done'
+            ).await.map(|_| ());
 
             send_result(&response_tx, command_id, result).await?;
         },
 
+        // Get the status of the file store (space used/available)
         BackendCommand::QueryStatus { command_id } => {
             log::info!("Handling QueryStatus");
 
+            // Get the store status
             let status = storage::get_current_node_status(
                 &current_used_space_bytes,
                 &max_storage_bytes,
                 &current_chunk_count
             );
+
+            // Send the status using network function
             network::send_status_report(&response_tx, command_id, status).await?;
         },
 
+        // Unknown command
         BackendCommand::Unknown => {
             log::warn!("Received unknown or unparseable command - ignoring.");
-            // No response sent for unknown commands
         },
     }
 
     Ok(())
 }
 
-// Helper function to simplify result sending
 async fn send_result(response_tx: &mpsc::Sender<Message>, command_id: String, result: Result<()>) -> Result<()> {
+    // Helper function to send command results to backend
     if let Err(e) = &result {
         log::error!("Operation for command {} failed: {}", command_id, e);
     }
