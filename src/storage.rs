@@ -9,16 +9,7 @@ use anyhow::{Result, Context, anyhow};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use futures_util::{Stream, StreamExt, TryStreamExt};
-use serde::Serialize;
 use sysinfo::{System, Disks};
-
-#[derive(Serialize, Debug, Clone)]
-pub struct NodeStatus {
-    pub used_space_bytes: u64,
-    pub max_space_bytes: u64,
-    pub free_space_bytes: u64,
-    pub chunk_count: u64,
-}
 
 // Helper function to get the path for a chunk
 fn get_chunk_path(base_path: &Path, chunk_id: &str) -> PathBuf {
@@ -348,17 +339,5 @@ async fn remove_dir_if_empty(dir_path: &Path) -> Result<bool> {
                 Err(anyhow!(e).context(format!("Error reading directory {:?}", dir_path)))
             }
         }
-    }
-}
-
-pub fn get_current_node_status(current_used_space_bytes: &Arc<AtomicU64>, max_storage_bytes: &Arc<AtomicU64>, current_chunk_count: &Arc<AtomicU64>) -> NodeStatus {
-    // Return the current status of the file store
-    let used = current_used_space_bytes.load(Ordering::Relaxed);
-    let max_cap = max_storage_bytes.load(Ordering::Relaxed);
-    NodeStatus {
-        used_space_bytes: used,
-        max_space_bytes: max_cap,
-        free_space_bytes: max_cap.saturating_sub(used),
-        chunk_count: current_chunk_count.load(Ordering::Relaxed),
     }
 }

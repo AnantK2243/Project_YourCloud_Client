@@ -9,6 +9,14 @@ use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use reqwest::Client as HttpClient;
+use std::sync::atomic::Ordering;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeStatus {
+    pub used_space_bytes: u64,
+    pub max_space_bytes: u64,
+    pub current_chunk_count: u64,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "command_type", rename_all = "SCREAMING_SNAKE_CASE")] // Use tag for easy parsing
@@ -16,13 +24,14 @@ pub enum BackendCommand {
     StoreChunk { command_id: String, chunk_id: String, expected_size_bytes: u64, data_source_url: String },
     RetrieveChunk { command_id: String, chunk_id: String, upload_destination_url: String },
     DeleteChunk { command_id: String, chunk_id: String },
-    QueryStatus { command_id: String },
+    StatusRequest { command_id: String },
     #[serde(other)] // Error Out Unrecognized commands
     Unknown,
 }
 
 pub async fn handle_command(command: BackendCommand, storage_path: std::path::PathBuf, response_tx: mpsc::Sender<Message>, current_used_space_bytes: Arc<AtomicU64>, max_storage_bytes: Arc<AtomicU64>, current_chunk_count: Arc<AtomicU64>) -> Result<()> {
-    let http_client = HttpClient::new();
+    let http_client = HttpClient::builder()
+        .build()?;
 
     match command {
         // Add file to store
@@ -98,16 +107,17 @@ pub async fn handle_command(command: BackendCommand, storage_path: std::path::Pa
             send_result(&response_tx, command_id, result).await?;
         },
 
-        // Get the status of the file store (space used/available)
-        BackendCommand::QueryStatus { command_id } => {
-            log::info!("Handling QueryStatus");
+        // Handle status request from server (responds with current node status)
+        BackendCommand::StatusRequest { command_id } => {
+            log::info!("Handling StatusRequest");
 
             // Get the store status
-            let status = storage::get_current_node_status(
-                &current_used_space_bytes,
-                &max_storage_bytes,
-                &current_chunk_count
-            );
+
+            let status = NodeStatus {
+                used_space_bytes: current_used_space_bytes.load(Ordering::Relaxed),
+                max_space_bytes: max_storage_bytes.load(Ordering::Relaxed),
+                current_chunk_count: current_chunk_count.load(Ordering::Relaxed)
+            };
 
             // Send the status using network function
             network::send_status_report(&response_tx, command_id, status).await?;

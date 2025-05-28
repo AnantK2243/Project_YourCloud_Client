@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, timeout};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{connect_async, connect_async_tls_with_config, Connector};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use sysinfo::System;
 
@@ -99,9 +99,24 @@ impl Network {
     }
 
     async fn establish_and_process_messages(&self, outgoing_responses_rx: &mut mpsc::Receiver<Message>) -> Result<()> {
-        let (ws_stream, response) = connect_async(&self.backend_ws_url)
-            .await
-            .with_context(|| format!("Failed to connect to backend WebSocket: {}", self.backend_ws_url))?;
+        let (ws_stream, response) = if self.backend_ws_url.starts_with("wss://") {
+            // Create TLS connector that accepts invalid certificates for self-signed certs
+            let native_tls_connector = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
+                .build()
+                .context("Failed to build native TLS connector")?;
+            
+            let connector = Connector::NativeTls(native_tls_connector);
+            
+            connect_async_tls_with_config(&self.backend_ws_url, None, false, Some(connector))
+                .await
+                .with_context(|| format!("Failed to connect to backend WebSocket: {}", self.backend_ws_url))?
+        } else {
+            connect_async(&self.backend_ws_url)
+                .await
+                .with_context(|| format!("Failed to connect to backend WebSocket: {}", self.backend_ws_url))?
+        };
         debug!("WebSocket handshake response: {:?}", response);
         info!("Successfully connected to backend WebSocket: {}", self.backend_ws_url);
 
@@ -269,7 +284,7 @@ async fn register_node(config: &mut Config, http_client: &HttpClient) -> Result<
     let backend_api_url = config.backend_api_url.clone();
 
     // Generate api endpoint
-    let registration_url = format!("{}/register_node", backend_api_url);
+    let registration_url = format!("{}/api/register-node", backend_api_url);
     info!("Registering node with backend: {}", registration_url);
 
     // Send the payload and wait for response
@@ -303,24 +318,20 @@ async fn register_node(config: &mut Config, http_client: &HttpClient) -> Result<
 
 
 pub async fn start_communication_loop(mut config: Config, used_space_bytes: Arc<AtomicU64>, max_storage_bytes: Arc<AtomicU64>, chunk_count: Arc<AtomicU64>) -> Result<()> {
-    let http_client = HttpClient::new();
+    let http_client = HttpClient::builder()
+        .danger_accept_invalid_certs(true) // Allow invalid certs for registration endpoint
+        .build()?;
 
-    // Ensure backend_ws_url uses WSS
-    if config.backend_ws_url.starts_with("ws://") {
-        warn!("Configured backend_ws_url uses WS. Automatically upgrading to WSS for security: {}", config.backend_ws_url);
-        config.backend_ws_url = config.backend_ws_url.replace("ws://", "wss://");
-    } else if !config.backend_ws_url.starts_with("wss://") {
-        warn!("Configured backend_ws_url does not specify a scheme. Assuming WSS: {}", config.backend_ws_url);
-        config.backend_ws_url = format!("wss://{}", config.backend_ws_url);
+    // Ensure backend_ws_url has a scheme, but allow WS for local development
+    if !config.backend_ws_url.starts_with("ws://") && !config.backend_ws_url.starts_with("wss://") {
+        warn!("Configured backend_ws_url does not specify a scheme. Assuming WS for local development: {}", config.backend_ws_url);
+        config.backend_ws_url = format!("ws://{}", config.backend_ws_url);
     }
 
-    // Ensure backend_api_url uses HTTPS
-    if config.backend_api_url.starts_with("http://") {
-        warn!("Configured backend_api_url uses HTTP. Automatically upgrading to HTTPS for security: {}", config.backend_api_url);
-        config.backend_api_url = config.backend_api_url.replace("http://", "https://");
-    } else if !config.backend_api_url.starts_with("https://") {
-        warn!("Configured backend_api_url does not specify a scheme. Assuming HTTPS: {}", config.backend_api_url);
-        config.backend_api_url = format!("https://{}", config.backend_api_url);
+    // Ensure backend_api_url has a scheme, but allow HTTP for local development
+    if !config.backend_api_url.starts_with("http://") && !config.backend_api_url.starts_with("https://") {
+        warn!("Configured backend_api_url does not specify a scheme. Assuming HTTP for local development: {}", config.backend_api_url);
+        config.backend_api_url = format!("http://{}", config.backend_api_url);
     }
 
 

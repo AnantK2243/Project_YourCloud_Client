@@ -15,9 +15,7 @@ pub struct Config {
     pub backend_ws_url: String,
     pub storage_path: PathBuf,
     pub max_storage_gib: u64,
-    pub log_level: String,
-    pub check_interval_seconds: u64,
-    pub recalibration_interval_seconds: u64,
+    pub log_level: String
 }
 
 impl Default for Config {
@@ -44,13 +42,11 @@ impl Default for Config {
         Self {
             node_id: String::new(),
             auth_token: String::new(),
-            backend_api_url: "".to_string(),
-            backend_ws_url: "".to_string(),
+            backend_api_url: "https://localhost:3001".to_string(),
+            backend_ws_url: "wss://localhost:8080".to_string(),
             storage_path: default_storage_path,
             max_storage_gib: 20,
-            log_level: "info".to_string(),
-            check_interval_seconds: 60,
-            recalibration_interval_seconds: 3600,
+            log_level: "info".to_string()
         }
     }
 }
