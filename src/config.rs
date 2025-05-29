@@ -52,7 +52,7 @@ impl Default for Config {
             backend_ws_url: DEFAULT_BACKEND_WS_URL.to_string(),
             storage_path: default_storage_path,
             max_storage_gib: 20,
-            log_level: "info".to_string()
+            log_level: "error".to_string()
         }
     }
 }
@@ -75,11 +75,27 @@ pub async fn load_config() -> Result<Config> {
     let config_content = fs::read_to_string(&config_path).await
         .context("Failed to read config file")?;
 
-    let mut config: Config = toml::from_str(&config_content)
+    #[derive(Deserialize)]
+    struct FileConfig {
+        pub node_id: String,
+        pub auth_token: String,
+        pub storage_path: PathBuf,
+        pub max_storage_gib: u64,
+        pub log_level: String
+    }
+
+    let file_config: FileConfig = toml::from_str(&config_content)
         .context("Failed to parse config file")?;
 
-    config.backend_api_url = DEFAULT_BACKEND_API_URL.to_string();
-    config.backend_ws_url = DEFAULT_BACKEND_WS_URL.to_string();
+    let config = Config {
+        node_id: file_config.node_id,
+        auth_token: file_config.auth_token,
+        storage_path: file_config.storage_path,
+        max_storage_gib: file_config.max_storage_gib,
+        log_level: file_config.log_level,
+        backend_api_url: DEFAULT_BACKEND_API_URL.to_string(), // Add URL from constant
+        backend_ws_url: DEFAULT_BACKEND_WS_URL.to_string(),   // Add URL from constant
+    };
 
     validate_config(&config)?;
     Ok(config)
