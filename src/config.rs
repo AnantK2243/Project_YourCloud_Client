@@ -5,7 +5,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use dirs;
 use tokio::fs;
-use std::env; // Added for environment variable access
+use std::env;
+
+// Centralized URL configuration - easy to adjust in the future
+const DEFAULT_BACKEND_API_URL: &str = "https://localhost:3002";
+const DEFAULT_BACKEND_WS_URL: &str = "wss://localhost:8080";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -33,20 +37,22 @@ impl Default for Config {
             })
             .unwrap_or_else(|| {
                 // Dump to working directory
-                log::warn!("Could not determine home directory or USER env var. Defaulting storage_path to current directory + 'Project_YourCloud'.");
-                std::env::current_dir()
+                eprintln!("WARN: Could not determine home directory or USER env var. Defaulting storage_path to current directory + 'Project_YourCloud'.");
+                let fallback_path = std::env::current_dir()
                     .unwrap_or_else(|_| PathBuf::from("/tmp"))
-                    .join("Project_YourCloud")
+                    .join("Project_YourCloud");
+                println!("INFO: Fallback storage path: {:?}", fallback_path);
+                fallback_path
             });
 
         Self {
             node_id: String::new(),
             auth_token: String::new(),
-            backend_api_url: "https://localhost:3001".to_string(),
-            backend_ws_url: "wss://localhost:8080".to_string(),
+            backend_api_url: DEFAULT_BACKEND_API_URL.to_string(),
+            backend_ws_url: DEFAULT_BACKEND_WS_URL.to_string(),
             storage_path: default_storage_path,
             max_storage_gib: 20,
-            log_level: "info".to_string()
+            log_level: "error".to_string()
         }
     }
 }
@@ -56,23 +62,40 @@ pub async fn load_config() -> Result<Config> {
     
     // First time run, create default config file at path
     if !config_path.exists() {
-        log::info!("Config file not found, creating default at: {:?}", config_path);
-        let default_config = Config::default();
+        println!("INFO: Config file not found, creating default at: {:?}", config_path);        let default_config = Config::default();
         save_config(&default_config).await?;
 
         // Return default config
         return Ok(default_config);
     }
 
-    log::info!("Config found: {:?}", config_path);
-
+    println!("INFO: Config found: {:?}", config_path);
 
     // Read and return
     let config_content = fs::read_to_string(&config_path).await
         .context("Failed to read config file")?;
 
-    let config: Config = toml::from_str(&config_content)
+    #[derive(Deserialize)]
+    struct FileConfig {
+        pub node_id: String,
+        pub auth_token: String,
+        pub storage_path: PathBuf,
+        pub max_storage_gib: u64,
+        pub log_level: String
+    }
+
+    let file_config: FileConfig = toml::from_str(&config_content)
         .context("Failed to parse config file")?;
+
+    let config = Config {
+        node_id: file_config.node_id,
+        auth_token: file_config.auth_token,
+        storage_path: file_config.storage_path,
+        max_storage_gib: file_config.max_storage_gib,
+        log_level: file_config.log_level,
+        backend_api_url: DEFAULT_BACKEND_API_URL.to_string(), // Add URL from constant
+        backend_ws_url: DEFAULT_BACKEND_WS_URL.to_string(),   // Add URL from constant
+    };
 
     validate_config(&config)?;
     Ok(config)
@@ -85,8 +108,25 @@ pub async fn save_config(config: &Config) -> Result<()> {
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).await?;
     }
+
+    #[derive(Serialize)]
+    struct SaveConfig {
+        pub node_id: String,
+        pub auth_token: String,
+        pub storage_path: PathBuf,
+        pub max_storage_gib: u64,
+        pub log_level: String
+    }
+
+    let save_config = SaveConfig {
+        node_id: config.node_id.clone(),
+        auth_token: config.auth_token.clone(),
+        storage_path: config.storage_path.clone(),
+        max_storage_gib: config.max_storage_gib,
+        log_level: config.log_level.clone()
+    };
     
-    let toml_string = toml::to_string_pretty(config)?;
+    let toml_string = toml::to_string_pretty(&save_config)?;
     fs::write(&config_path, toml_string).await?;
     
     Ok(())
