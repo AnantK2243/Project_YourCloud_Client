@@ -1,19 +1,21 @@
 // src/storage.rs
 
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt, TryStreamExt};
+use log::{debug, error, info, trace, warn};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use sysinfo::{Disks, System};
 use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio_util::codec::{FramedRead, BytesCodec};
-use bytes::Bytes;
-use anyhow::{Result, Context, anyhow};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use futures_util::{Stream, StreamExt, TryStreamExt};
-use sysinfo::{System, Disks};
+use tokio_util::codec::{BytesCodec, FramedRead};
 
 // Helper function to get the path for a chunk
 fn get_chunk_path(base_path: &Path, chunk_id: &str) -> PathBuf {
-    if chunk_id.len() < 4 { // Use 4 chars (e.g., ab/cd) for better sharding
+    if chunk_id.len() < 4 {
+        // Use 4 chars (e.g., ab/cd) for better sharding
         return base_path.join(chunk_id); // Fallback for very short IDs (unlikely)
     }
     let subdir1 = &chunk_id[0..2];
@@ -24,8 +26,12 @@ fn get_chunk_path(base_path: &Path, chunk_id: &str) -> PathBuf {
 
 pub fn get_disk_available_space(storage_path: &Path) -> Result<u64> {
     // Converts the given storage path to its absolute canonical path.
-    let canonical_storage_path = storage_path.canonicalize()
-        .with_context(|| format!("Failed to canonicalize storage path for disk space check: {:?}. Ensure it exists.", storage_path))?;
+    let canonical_storage_path = storage_path.canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize storage path for disk space check: {:?}. Ensure it exists.",
+            storage_path
+        )
+    })?;
 
     // Fetches a list of all disks on the system.
     let disks = Disks::new_with_refreshed_list();
@@ -50,7 +56,7 @@ pub fn get_disk_available_space(storage_path: &Path) -> Result<u64> {
 
     // If a matching disk was found.
     if let Some(disk) = best_match_disk {
-        // log::info!( 
+        // log::info!(
         //     "Storage path {:?} is on disk mounted at {:?} (Disk: {:?}, FS: {:?}, Total: {} bytes, Available: {} bytes)",
         //     canonical_storage_path,
         //     disk.mount_point(),
@@ -59,7 +65,7 @@ pub fn get_disk_available_space(storage_path: &Path) -> Result<u64> {
         //     disk.total_space(),
         //     disk.available_space()
         // );
-        
+
         // Returns the available space on the disk.
         Ok(disk.available_space())
     } else {
@@ -71,8 +77,10 @@ pub fn get_disk_available_space(storage_path: &Path) -> Result<u64> {
     }
 }
 
-
-pub async fn initialize_storage_state(storage_path_base: &Path, max_storage_gib: u64) -> Result<(Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>)> {
+pub async fn initialize_storage_state(
+    storage_path_base: &Path,
+    max_storage_gib: u64,
+) -> Result<(Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>)> {
     let current_used_space = Arc::new(AtomicU64::new(0));
     let current_chunk_count = Arc::new(AtomicU64::new(0));
     let max_bytes = Arc::new(AtomicU64::new(max_storage_gib * 1024 * 1024 * 1024));
@@ -81,12 +89,20 @@ pub async fn initialize_storage_state(storage_path_base: &Path, max_storage_gib:
     if !storage_path_base.exists() {
         fs::create_dir_all(storage_path_base)
             .await
-            .with_context(|| format!("Failed to create base storage directory: {:?}", storage_path_base))?;
-        log::info!("Created base storage directory: {:?}", storage_path_base);
+            .with_context(|| {
+                format!(
+                    "Failed to create base storage directory: {:?}",
+                    storage_path_base
+                )
+            })?;
+        info!("Created base storage directory: {:?}", storage_path_base);
     }
 
     // Check for existing files
-    log::info!("Scanning storage directory {:?} for existing chunks...", storage_path_base);
+    info!(
+        "Scanning storage directory {:?} for existing chunks...",
+        storage_path_base
+    );
     let mut total_size = 0u64;
     let mut total_count = 0u64;
     let mut first_level_dirs = fs::read_dir(storage_path_base).await?;
@@ -109,7 +125,10 @@ pub async fn initialize_storage_state(storage_path_base: &Path, max_storage_gib:
                                     total_count += 1;
                                 }
                                 Err(e) => {
-                                    log::warn!("Failed to get metadata for file {:?}: {}", chunk_path, e);
+                                    warn!(
+                                        "Failed to get metadata for file {:?}: {}",
+                                        chunk_path, e
+                                    );
                                 }
                             }
                         }
@@ -122,7 +141,7 @@ pub async fn initialize_storage_state(storage_path_base: &Path, max_storage_gib:
     current_used_space.store(total_size, Ordering::SeqCst);
     current_chunk_count.store(total_count, Ordering::SeqCst);
 
-    log::info!(
+    info!(
         "Storage scan complete: Used: {} bytes, Max: {} bytes, Chunks: {}",
         total_size,
         max_bytes.load(Ordering::SeqCst),
@@ -131,13 +150,21 @@ pub async fn initialize_storage_state(storage_path_base: &Path, max_storage_gib:
     Ok((current_used_space, max_bytes, current_chunk_count))
 }
 
-pub async fn store_chunk_to_disk(storage_path_base: &Path, chunk_id: &str, mut data_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin, expected_size_bytes: u64, current_used_space_bytes: &Arc<AtomicU64>, max_storage_bytes: &Arc<AtomicU64>, current_chunk_count: &Arc<AtomicU64>) -> Result<u64> {
+pub async fn store_chunk_to_disk(
+    storage_path_base: &Path,
+    chunk_id: &str,
+    mut data_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    expected_size_bytes: u64,
+    current_used_space_bytes: &Arc<AtomicU64>,
+    max_storage_bytes: &Arc<AtomicU64>,
+    current_chunk_count: &Arc<AtomicU64>,
+) -> Result<u64> {
     // Function to add a chunk to store
     let chunk_path = get_chunk_path(storage_path_base, chunk_id);
 
     // Check for pre-existence
     if tokio::fs::try_exists(&chunk_path).await.unwrap_or(false) {
-        log::warn!("Chunk {} already exists, refusing to overwrite.", chunk_id);
+        warn!("Chunk {} already exists, refusing to overwrite.", chunk_id);
         return Err(anyhow!("Chunk {} already exists.", chunk_id));
     }
 
@@ -180,7 +207,7 @@ pub async fn store_chunk_to_disk(storage_path_base: &Path, chunk_id: &str, mut d
             }
         }
         Err(e) => {
-            log::warn!(
+            warn!(
                 "Could not reliably determine available disk space for path {:?}: {}. Proceeding with caution.",
                 storage_path_base,
                 e
@@ -190,32 +217,48 @@ pub async fn store_chunk_to_disk(storage_path_base: &Path, chunk_id: &str, mut d
 
     // Ensure parent directory exists
     if let Some(parent_dir) = chunk_path.parent() {
-        fs::create_dir_all(parent_dir).await.with_context(|| format!("Failed to create directory for chunk: {:?}", parent_dir))?;
+        fs::create_dir_all(parent_dir)
+            .await
+            .with_context(|| format!("Failed to create directory for chunk: {:?}", parent_dir))?;
     } else {
-        return Err(anyhow!("Invalid chunk path, no parent dir: {:?}", chunk_path));
+        return Err(anyhow!(
+            "Invalid chunk path, no parent dir: {:?}",
+            chunk_path
+        ));
     }
 
     // Stream data to file
-    let mut file = fs::File::create(&chunk_path).await.with_context(|| format!("Failed to create file for chunk: {:?}", chunk_path))?;
+    let mut file = fs::File::create(&chunk_path)
+        .await
+        .with_context(|| format!("Failed to create file for chunk: {:?}", chunk_path))?;
     let mut bytes_written: u64 = 0;
 
     while let Some(data_result) = data_stream.next().await {
         let data_bytes = data_result.context("Error streaming chunk data from source")?;
-        file.write_all(&data_bytes).await.with_context(|| format!("Failed to write data to chunk file: {:?}", chunk_path))?;
+        file.write_all(&data_bytes)
+            .await
+            .with_context(|| format!("Failed to write data to chunk file: {:?}", chunk_path))?;
         bytes_written += data_bytes.len() as u64;
     }
-    file.sync_all().await.with_context(|| format!("Failed to sync chunk file: {:?}", chunk_path))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("Failed to sync chunk file: {:?}", chunk_path))?;
 
     // Verify size and update atomics
     if bytes_written != expected_size_bytes {
-        log::error!("Size mismatch for chunk {}: Expected {}, wrote {}. Deleting.", chunk_id, expected_size_bytes, bytes_written);
-        fs::remove_file(&chunk_path).await.with_context(|| format!("Failed to delete mismatched chunk file: {:?}", chunk_path))?;
+        error!(
+            "Size mismatch for chunk {}: Expected {}, wrote {}. Deleting.",
+            chunk_id, expected_size_bytes, bytes_written
+        );
+        fs::remove_file(&chunk_path)
+            .await
+            .with_context(|| format!("Failed to delete mismatched chunk file: {:?}", chunk_path))?;
         return Err(anyhow!("Size mismatch. Chunk deleted."));
     }
 
     current_used_space_bytes.fetch_add(bytes_written, Ordering::SeqCst);
     current_chunk_count.fetch_add(1, Ordering::SeqCst);
-    log::info!(
+    info!(
         "Stored chunk {}: {} bytes. New usage: {} bytes, {} chunks.",
         chunk_id,
         bytes_written,
@@ -226,10 +269,13 @@ pub async fn store_chunk_to_disk(storage_path_base: &Path, chunk_id: &str, mut d
     Ok(bytes_written)
 }
 
-pub async fn retrieve_chunk_from_disk(storage_path_base: &Path, chunk_id: &str) -> Result<impl Stream<Item = Result<Bytes, std::io::Error>>> {
+pub async fn retrieve_chunk_from_disk(
+    storage_path_base: &Path,
+    chunk_id: &str,
+) -> Result<impl Stream<Item = Result<Bytes, std::io::Error>>> {
     // Function to retrieve a chunk from store
     let chunk_path = get_chunk_path(storage_path_base, chunk_id);
-    log::debug!("Attempting to retrieve chunk from {:?}", chunk_path);
+    debug!("Attempting to retrieve chunk from {:?}", chunk_path);
 
     // Check for chunk existence
     if !tokio::fs::try_exists(&chunk_path).await.unwrap_or(false) {
@@ -237,25 +283,34 @@ pub async fn retrieve_chunk_from_disk(storage_path_base: &Path, chunk_id: &str) 
     }
 
     // Access file store, error on failure
-    let file = fs::File::open(&chunk_path).await.with_context(|| format!("Failed to open chunk file: {:?}", chunk_path))?;
+    let file = fs::File::open(&chunk_path)
+        .await
+        .with_context(|| format!("Failed to open chunk file: {:?}", chunk_path))?;
     let reader = BufReader::new(file);
     let stream = FramedRead::new(reader, BytesCodec::new()).map_ok(|bytes| bytes.freeze());
     Ok(stream)
 }
 
-pub async fn delete_chunk_from_disk(storage_path_base: &Path, chunk_id: &str, current_used_space_bytes: &Arc<AtomicU64>, current_chunk_count: &Arc<AtomicU64>) -> Result<Option<u64>> {
+pub async fn delete_chunk_from_disk(
+    storage_path_base: &Path,
+    chunk_id: &str,
+    current_used_space_bytes: &Arc<AtomicU64>,
+    current_chunk_count: &Arc<AtomicU64>,
+) -> Result<Option<u64>> {
     // Function to delete a chunk from store
     let chunk_path = get_chunk_path(storage_path_base, chunk_id);
-    
+
     match fs::metadata(&chunk_path).await {
         Ok(metadata) => {
             let size = metadata.len();
             // Delete the chunk from the store
-            fs::remove_file(&chunk_path).await.with_context(|| format!("Failed to delete chunk file: {:?}", chunk_path))?;
+            fs::remove_file(&chunk_path)
+                .await
+                .with_context(|| format!("Failed to delete chunk file: {:?}", chunk_path))?;
 
             current_used_space_bytes.fetch_sub(size, Ordering::SeqCst);
             current_chunk_count.fetch_sub(1, Ordering::SeqCst);
-            log::info!(
+            info!(
                 "Deleted chunk {}: {} bytes. New usage: {} bytes, {} chunks.",
                 chunk_id,
                 size,
@@ -264,26 +319,33 @@ pub async fn delete_chunk_from_disk(storage_path_base: &Path, chunk_id: &str, cu
             );
 
             // Attempt to remove empty parent directories
-            if chunk_id.len() >= 4 { // Only if subdir1/subdir2 structure was used
-                if let Some(parent_dir) = chunk_path.parent() { // This is base_path/subdir1/subdir2
+            if chunk_id.len() >= 4 {
+                // Only if subdir1/subdir2 structure was used
+                if let Some(parent_dir) = chunk_path.parent() {
+                    // This is base_path/subdir1/subdir2
                     match remove_dir_if_empty(parent_dir).await {
-                        Ok(true) => { // parent_dir (subdir2) was removed
-                            log::debug!("Removed empty shard directory: {:?}", parent_dir);
+                        Ok(true) => {
+                            // parent_dir (subdir2) was removed
+                            debug!("Removed empty shard directory: {:?}", parent_dir);
                             // If subdir2 was removed, try to remove subdir1
-                            if let Some(grandparent_dir) = parent_dir.parent() { // This is base_path/subdir1
+                            if let Some(grandparent_dir) = parent_dir.parent() {
+                                // This is base_path/subdir1
                                 // Ensure we don't try to remove the storage_path_base itself
                                 if grandparent_dir != storage_path_base {
                                     match remove_dir_if_empty(grandparent_dir).await {
-                                        Ok(true) => log::debug!("Removed empty shard directory: {:?}", grandparent_dir),
+                                        Ok(true) => debug!("Removed empty shard directory: {:?}", grandparent_dir),
                                         Ok(false) => { /* Grandparent not empty or not removed, do nothing */ }
-                                        Err(e) => log::warn!("Failed to attempt removal of grandparent directory {:?}: {}", grandparent_dir, e),
+                                        Err(e) => warn!("Failed to attempt removal of grandparent directory {:?}: {}", grandparent_dir, e),
                                     }
                                 }
                             }
                         }
                         Ok(false) => { /* Parent not empty or not removed, do nothing */ }
                         Err(e) => {
-                            log::warn!("Failed to attempt removal of parent directory {:?}: {}", parent_dir, e);
+                            warn!(
+                                "Failed to attempt removal of parent directory {:?}: {}",
+                                parent_dir, e
+                            );
                         }
                     }
                 }
@@ -291,10 +353,14 @@ pub async fn delete_chunk_from_disk(storage_path_base: &Path, chunk_id: &str, cu
             Ok(Some(size))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            log::warn!("Attempted to delete non-existent chunk: {}", chunk_id);
+            warn!("Attempted to delete non-existent chunk: {}", chunk_id);
             Ok(None)
         }
-        Err(e) => Err(anyhow!("Error getting metadata for chunk {} to delete: {}", chunk_id, e)),
+        Err(e) => Err(anyhow!(
+            "Error getting metadata for chunk {} to delete: {}",
+            chunk_id,
+            e
+        )),
     }
 }
 
@@ -313,26 +379,32 @@ async fn remove_dir_if_empty(dir_path: &Path) -> Result<bool> {
                         }
                         Err(e) => {
                             // Failed to remove, treat as not removed for the caller
-                            log::warn!("Failed to remove supposedly empty directory {:?}: {}. It might have been repopulated or there are permission issues.", dir_path, e);
+                            warn!("Failed to remove supposedly empty directory {:?}: {}. It might have been repopulated or there are permission issues.", dir_path, e);
                             Ok(false)
                         }
                     }
                 }
                 // Directory is not empty
-                Ok(Some(_)) => { 
-                    log::trace!("Directory {:?} is not empty, not removing.", dir_path);
+                Ok(Some(_)) => {
+                    trace!("Directory {:?} is not empty, not removing.", dir_path);
                     Ok(false)
                 }
                 Err(e) => {
                     // Error trying to read the first entry
-                    Err(anyhow!(e).context(format!("Error checking if directory {:?} is empty (reading first entry)", dir_path)))
+                    Err(anyhow!(e).context(format!(
+                        "Error checking if directory {:?} is empty (reading first entry)",
+                        dir_path
+                    )))
                 }
             }
         }
         Err(e) => {
             // Directory not found
             if e.kind() == std::io::ErrorKind::NotFound {
-                log::debug!("Directory {:?} not found, cannot remove if empty (already gone).", dir_path);
+                debug!(
+                    "Directory {:?} not found, cannot remove if empty (already gone).",
+                    dir_path
+                );
                 Ok(false)
             } else {
                 // Error trying to read the directory itself
