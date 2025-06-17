@@ -6,7 +6,7 @@ use tokio::fs;
 use tokio::signal;
 
 // Backend WebSocket URL configuration
-const WS_URL: &str = "wss://localhost:8080";
+const WS_URL: &str = "wss://wss.project-yourcloud.me";
 
 // Declare modules
 mod commands;
