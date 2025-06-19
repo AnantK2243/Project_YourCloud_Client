@@ -2,9 +2,9 @@
 
 use crate::network;
 use crate::storage;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose, Engine as _};
 use log::{error, info, warn};
-use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -25,13 +25,11 @@ pub enum BackendCommand {
     StoreChunk {
         command_id: String,
         chunk_id: String,
-        expected_size_bytes: u64,
-        data_source_url: String,
+        data: String,
     },
-    RetrieveChunk {
+    GetChunk {
         command_id: String,
         chunk_id: String,
-        upload_destination_url: String,
     },
     DeleteChunk {
         command_id: String,
@@ -52,31 +50,22 @@ pub async fn handle_command(
     max_storage_bytes: Arc<AtomicU64>,
     current_chunk_count: Arc<AtomicU64>,
 ) -> Result<()> {
-    let http_client = HttpClient::builder().build()?;
-
     match command {
-        // Add file to store
+        // Store chunk data directly
         BackendCommand::StoreChunk {
             command_id,
             chunk_id,
-            expected_size_bytes,
-            data_source_url,
+            data,
         } => {
             info!("Handling StoreChunk: {}", chunk_id);
 
-            // Get the data from download link
-            let download_result = http_client.get(&data_source_url).send().await;
-
-            // Parse result of call
-            let result = match download_result {
-                Ok(response) if response.status().is_success() => {
-                    // Store the chunk to store
-                    let data_stream = response.bytes_stream();
-                    storage::store_chunk_to_disk(
+            // Decode base64 data
+            let result = match general_purpose::STANDARD.decode(&data) {
+                Ok(chunk_data) => {
+                    storage::store_chunk_data_to_disk(
                         &storage_path,
                         &chunk_id,
-                        data_stream,
-                        expected_size_bytes,
+                        &chunk_data,
                         &current_used_space_bytes,
                         &max_storage_bytes,
                         &current_chunk_count,
@@ -84,48 +73,31 @@ pub async fn handle_command(
                     .await
                     .map(|_| ())
                 }
-                Ok(response) => Err(anyhow!(
-                    "Download failed with status: {}",
-                    response.status()
-                )),
-                Err(e) => Err(anyhow!("Download request failed: {}", e)),
+                Err(e) => Err(anyhow!("Failed to decode base64 data: {}", e)),
             };
 
             send_result(&response_tx, command_id, result).await?;
         }
 
-        // Get file from store
-        BackendCommand::RetrieveChunk {
+        // Get chunk and return data directly
+        BackendCommand::GetChunk {
             command_id,
             chunk_id,
-            upload_destination_url,
         } => {
-            info!("Handling RetrieveChunk: {}", chunk_id);
+            info!("Handling GetChunk: {}", chunk_id);
 
-            // Get the required chunk from store
-            let result = match storage::retrieve_chunk_from_disk(&storage_path, &chunk_id).await {
-                Ok(stream) => {
-                    // Upload the file to requested link
-                    let body = reqwest::Body::wrap_stream(stream);
-                    http_client
-                        .put(&upload_destination_url)
-                        .body(body)
-                        .send()
-                        .await
-                        .context("Upload request failed")
-                        .and_then(|response| {
-                            if response.status().is_success() {
-                                info!("Successfully uploaded chunk {}", chunk_id);
-                                Ok(())
-                            } else {
-                                Err(anyhow!("Upload failed with status: {}", response.status()))
-                            }
-                        })
+            let result = storage::retrieve_chunk_data_from_disk(&storage_path, &chunk_id).await;
+
+            match result {
+                Ok(chunk_data) => {
+                    // Encode data as base64 and send back
+                    let encoded_data = general_purpose::STANDARD.encode(&chunk_data);
+                    network::send_chunk_data(&response_tx, command_id, encoded_data).await?;
                 }
-                Err(e) => Err(e),
-            };
-
-            send_result(&response_tx, command_id, result).await?;
+                Err(e) => {
+                    send_result(&response_tx, command_id, Err(e)).await?;
+                }
+            }
         }
 
         // Remove file from store
@@ -135,7 +107,6 @@ pub async fn handle_command(
         } => {
             info!("Handling DeleteChunk: {}", chunk_id);
 
-            // Delete the chunk_id node from store
             let result = storage::delete_chunk_from_disk(
                 &storage_path,
                 &chunk_id,
@@ -148,11 +119,9 @@ pub async fn handle_command(
             send_result(&response_tx, command_id, result).await?;
         }
 
-        // Handle status request from server (responds with current node status)
+        // Handle status request from server
         BackendCommand::StatusRequest { command_id } => {
             info!("Handling StatusRequest");
-
-            // Get the store status
 
             let status = NodeStatus {
                 used_space_bytes: current_used_space_bytes.load(Ordering::Relaxed),
@@ -160,7 +129,6 @@ pub async fn handle_command(
                 current_chunk_count: current_chunk_count.load(Ordering::Relaxed),
             };
 
-            // Send the status using network function
             network::send_status_report(&response_tx, command_id, status).await?;
         }
 
@@ -178,7 +146,6 @@ async fn send_result(
     command_id: String,
     result: Result<()>,
 ) -> Result<()> {
-    // Helper function to send command results to backend
     if let Err(e) = &result {
         error!("Operation for command {} failed: {}", command_id, e);
     }

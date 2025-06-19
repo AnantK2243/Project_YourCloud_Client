@@ -301,6 +301,36 @@ pub async fn send_status_report<S: Serialize>(
     Ok(())
 }
 
+#[derive(Serialize)]
+struct ChunkDataResponse<'a> {
+    r#type: &'a str,
+    command_id: &'a str,
+    success: bool,
+    data: String, // Base64 encoded chunk data
+}
+
+pub async fn send_chunk_data(
+    response_tx: &mpsc::Sender<Message>,
+    command_id: String,
+    encoded_data: String,
+) -> Result<()> {
+    let response = ChunkDataResponse {
+        r#type: "COMMAND_RESULT",
+        command_id: &command_id,
+        success: true,
+        data: encoded_data,
+    };
+
+    let response_text =
+        serde_json::to_string(&response).context("Failed to serialize chunk data response")?;
+
+    response_tx
+        .send(Message::Text(response_text))
+        .await
+        .context("Failed to send chunk data")?;
+    Ok(())
+}
+
 pub async fn start_communication_loop(
     config: Config,
     ws_url: String,
