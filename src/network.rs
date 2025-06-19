@@ -20,6 +20,7 @@ struct CommandResult<'a> {
     r#type: &'a str,
     command_id: &'a str,
     success: bool,
+    storage_delta: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -262,12 +263,14 @@ pub async fn send_command_result(
     response_tx: &mpsc::Sender<Message>,
     command_id: String,
     operation_result: Result<()>,
+    storage_delta: Option<i64>,
 ) -> Result<()> {
     let response = CommandResult {
         r#type: "COMMAND_RESULT",
         command_id: &command_id,
         success: operation_result.is_ok(),
         error: operation_result.err().map(|e| e.to_string()),
+        storage_delta,
     };
 
     let response_text =

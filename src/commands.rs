@@ -61,20 +61,32 @@ pub async fn handle_command(
 
             // Decode base64 data
             let result = match general_purpose::STANDARD.decode(&data) {
-                Ok(chunk_data) => storage::store_chunk_data_to_disk(
-                    &storage_path,
-                    &chunk_id,
-                    &chunk_data,
-                    &current_used_space_bytes,
-                    &max_storage_bytes,
-                    &current_chunk_count,
-                )
-                .await
-                .map(|_| ()),
+                Ok(chunk_data) => {
+                    match storage::store_chunk_data_to_disk(
+                        &storage_path,
+                        &chunk_id,
+                        &chunk_data,
+                        &current_used_space_bytes,
+                        &max_storage_bytes,
+                        &current_chunk_count,
+                    )
+                    .await
+                    {
+                        Ok(chunk_size) => {
+                            // Send positive storage delta for stored chunk
+                            send_result(&response_tx, command_id, Ok(()), Some(chunk_size as i64))
+                                .await?;
+                        }
+                        Err(e) => {
+                            send_result(&response_tx, command_id, Err(e), None).await?;
+                        }
+                    }
+                    return Ok(());
+                }
                 Err(e) => Err(anyhow!("Failed to decode base64 data: {}", e)),
             };
 
-            send_result(&response_tx, command_id, result).await?;
+            send_result(&response_tx, command_id, result, None).await?;
         }
 
         // Get chunk and return data directly
@@ -93,7 +105,7 @@ pub async fn handle_command(
                     network::send_chunk_data(&response_tx, command_id, encoded_data).await?;
                 }
                 Err(e) => {
-                    send_result(&response_tx, command_id, Err(e)).await?;
+                    send_result(&response_tx, command_id, Err(e), None).await?;
                 }
             }
         }
@@ -105,16 +117,32 @@ pub async fn handle_command(
         } => {
             info!("Handling DeleteChunk: {}", chunk_id);
 
-            let result = storage::delete_chunk_from_disk(
+            match storage::delete_chunk_from_disk(
                 &storage_path,
                 &chunk_id,
                 &current_used_space_bytes,
                 &current_chunk_count,
             )
             .await
-            .map(|_| ());
-
-            send_result(&response_tx, command_id, result).await?;
+            {
+                Ok(Some(deleted_size)) => {
+                    // Send negative storage delta for deleted chunk
+                    send_result(
+                        &response_tx,
+                        command_id,
+                        Ok(()),
+                        Some(-(deleted_size as i64)),
+                    )
+                    .await?;
+                }
+                Ok(None) => {
+                    // Chunk didn't exist, no storage change
+                    send_result(&response_tx, command_id, Ok(()), None).await?;
+                }
+                Err(e) => {
+                    send_result(&response_tx, command_id, Err(e), None).await?;
+                }
+            }
         }
 
         // Handle status request from server
@@ -132,7 +160,7 @@ pub async fn handle_command(
 
         // Unknown command
         BackendCommand::Unknown => {
-            warn!("Received unknown or unparseable command - ignoring.");
+            warn!("Received unknown or unparsable command - ignoring.");
         }
     }
 
@@ -143,9 +171,10 @@ async fn send_result(
     response_tx: &mpsc::Sender<Message>,
     command_id: String,
     result: Result<()>,
+    storage_delta: Option<i64>,
 ) -> Result<()> {
     if let Err(e) = &result {
         error!("Operation for command {} failed: {}", command_id, e);
     }
-    network::send_command_result(response_tx, command_id, result).await
+    network::send_command_result(response_tx, command_id, result, storage_delta).await
 }
