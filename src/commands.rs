@@ -61,18 +61,16 @@ pub async fn handle_command(
 
             // Decode base64 data
             let result = match general_purpose::STANDARD.decode(&data) {
-                Ok(chunk_data) => {
-                    storage::store_chunk_data_to_disk(
-                        &storage_path,
-                        &chunk_id,
-                        &chunk_data,
-                        &current_used_space_bytes,
-                        &max_storage_bytes,
-                        &current_chunk_count,
-                    )
-                    .await
-                    .map(|_| ())
-                }
+                Ok(chunk_data) => storage::store_chunk_data_to_disk(
+                    &storage_path,
+                    &chunk_id,
+                    &chunk_data,
+                    &current_used_space_bytes,
+                    &max_storage_bytes,
+                    &current_chunk_count,
+                )
+                .await
+                .map(|_| ()),
                 Err(e) => Err(anyhow!("Failed to decode base64 data: {}", e)),
             };
 
