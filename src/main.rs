@@ -13,6 +13,7 @@ mod commands;
 mod config;
 mod network;
 mod storage;
+mod webrtc;
 
 use crate::config::load_config;
 use crate::network::start_communication_loop;

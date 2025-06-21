@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NodeStatus {
     pub used_space_bytes: u64,
@@ -20,7 +19,7 @@ pub struct NodeStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "command_type", rename_all = "SCREAMING_SNAKE_CASE")] // Use tag for easy parsing
+#[serde(tag = "command_type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BackendCommand {
     StoreChunk {
         command_id: String,
@@ -42,7 +41,70 @@ pub enum BackendCommand {
     Unknown,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WebRTCCommand {
+    P2pForward {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "fromUserId")]
+        from_user_id: String,
+        #[serde(rename = "fileMetadata")]
+        file_metadata: serde_json::Value,
+    },
+    P2pRelay {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        payload: serde_json::Value,
+    },
+    P2pClose {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum Command {
+    Backend(BackendCommand),
+    WebRTC(WebRTCCommand),
+}
+
 pub async fn handle_command(
+    command: Command,
+    storage_path: std::path::PathBuf,
+    response_tx: mpsc::Sender<Message>,
+    current_used_space_bytes: Arc<AtomicU64>,
+    max_storage_bytes: Arc<AtomicU64>,
+    current_chunk_count: Arc<AtomicU64>,
+) -> Result<()> {
+    match command {
+        Command::Backend(backend_cmd) => {
+            handle_backend_command(
+                backend_cmd,
+                storage_path,
+                response_tx,
+                current_used_space_bytes,
+                max_storage_bytes,
+                current_chunk_count,
+            )
+            .await
+        }
+        Command::WebRTC(webrtc_cmd) => {
+            handle_webrtc_command(
+                webrtc_cmd,
+                storage_path,
+                response_tx,
+                current_used_space_bytes,
+                max_storage_bytes,
+                current_chunk_count,
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_backend_command(
     command: BackendCommand,
     storage_path: std::path::PathBuf,
     response_tx: mpsc::Sender<Message>,
@@ -165,6 +227,92 @@ pub async fn handle_command(
     }
 
     Ok(())
+}
+
+async fn handle_webrtc_command(
+    command: WebRTCCommand,
+    storage_path: std::path::PathBuf,
+    response_tx: mpsc::Sender<Message>,
+    current_used_space_bytes: Arc<AtomicU64>,
+    max_storage_bytes: Arc<AtomicU64>,
+    current_chunk_count: Arc<AtomicU64>,
+) -> Result<()> {
+    match command {
+        WebRTCCommand::P2pForward {
+            session_id,
+            from_user_id,
+            file_metadata,
+        } => {
+            info!(
+                "Handling P2P_FORWARD for session {}: from user {}",
+                session_id, from_user_id
+            );
+            info!("File metadata: {:?}", file_metadata);
+
+            // Create actual WebRTC session
+            crate::webrtc::create_webrtc_session(
+                session_id.clone(),
+                from_user_id,
+                file_metadata,
+                storage_path,
+                current_used_space_bytes,
+                max_storage_bytes,
+                current_chunk_count,
+                response_tx,
+            )
+            .await?;
+
+            info!("WebRTC session created for: {}", session_id);
+            Ok(())
+        }
+
+        WebRTCCommand::P2pRelay {
+            session_id,
+            payload,
+        } => {
+            info!("Handling P2P_RELAY for session {}", session_id);
+
+            if let Some(payload_type) = payload.get("type").and_then(|v| v.as_str()) {
+                match payload_type {
+                    "offer" => {
+                        info!("Processing WebRTC offer for session {}", session_id);
+                        if let Some(sdp) = payload.get("sdp").and_then(|v| v.as_str()) {
+                            crate::webrtc::process_webrtc_offer(&session_id, sdp, &response_tx)
+                                .await?;
+                        } else {
+                            warn!("Missing SDP in offer for session {}. Payload: {:?}", session_id, payload);
+                        }
+                    }
+                    "ice-candidate" => {
+                        info!("Processing ICE candidate for session {}", session_id);
+                        if let Some(candidate) = payload.get("candidate") {
+                            crate::webrtc::add_webrtc_ice_candidate(&session_id, candidate).await?;
+                        } else {
+                            warn!("Missing candidate data for session {}", session_id);
+                        }
+                    }
+                    _ => {
+                        warn!("Unknown P2P relay payload type: {}", payload_type);
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        WebRTCCommand::P2pClose { session_id, reason } => {
+            info!(
+                "Handling P2P_CLOSE for session {}: {:?}",
+                session_id, reason
+            );
+            if let Some(_session) = crate::webrtc::close_webrtc_session(&session_id).await {
+                info!("Successfully closed WebRTC session: {}", session_id);
+            } else {
+                warn!("WebRTC session not found for cleanup: {}", session_id);
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn send_result(

@@ -1,6 +1,6 @@
 // src/network.rs
 
-use crate::commands::BackendCommand;
+use crate::commands::{BackendCommand, Command, WebRTCCommand};
 use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -36,7 +36,7 @@ pub struct Network {
     ws_url: String,
     auth_token: String,
     node_id: String,
-    command_sender: mpsc::Sender<BackendCommand>,
+    command_sender: mpsc::Sender<Command>,
 }
 
 impl Network {
@@ -44,7 +44,7 @@ impl Network {
         ws_url: String,
         auth_token: String,
         node_id: String,
-        command_sender: mpsc::Sender<BackendCommand>,
+        command_sender: mpsc::Sender<Command>,
     ) -> Self {
         Self {
             ws_url,
@@ -233,27 +233,42 @@ impl Network {
     }
 
     async fn process_message(&self, message_text: String) -> Result<()> {
-        match serde_json::from_str::<BackendCommand>(&message_text) {
-            Ok(command) => {
-                debug!("Parsed command: {:?}", command);
-                if let Err(e) = self.command_sender.send(command).await {
-                    error!("Failed to send parsed command to internal channel: {}. Channel might be closed.", e);
-                    return Err(e.into());
-                }
+        // First try to parse as a regular BackendCommand
+        if let Ok(command) = serde_json::from_str::<BackendCommand>(&message_text) {
+            debug!("Parsed backend command: {:?}", command);
+            if let Err(e) = self.command_sender.send(Command::Backend(command)).await {
+                error!("Failed to send parsed backend command to internal channel: {}. Channel might be closed.", e);
+                return Err(e.into());
             }
-            Err(e) => {
-                error!(
-                    "Failed to parse incoming message as BackendCommand: {}. Message: '{}'",
-                    e, message_text
-                );
-                if let Err(send_err) = self.command_sender.send(BackendCommand::Unknown).await {
-                    error!(
-                        "Failed to send Unknown command to internal channel: {}",
-                        send_err
-                    );
-                }
-            }
+            return Ok(());
         }
+
+        // If that fails, try to parse as a WebRTC command
+        if let Ok(webrtc_cmd) = serde_json::from_str::<WebRTCCommand>(&message_text) {
+            debug!("Parsed WebRTC command: {:?}", webrtc_cmd);
+            if let Err(e) = self.command_sender.send(Command::WebRTC(webrtc_cmd)).await {
+                error!("Failed to send parsed WebRTC command to internal channel: {}. Channel might be closed.", e);
+                return Err(e.into());
+            }
+            return Ok(());
+        }
+
+        // If both fail, log error and send Unknown command
+        error!(
+            "Failed to parse incoming message as either BackendCommand or WebRTCCommand. Message: '{}'",
+            message_text
+        );
+        if let Err(send_err) = self
+            .command_sender
+            .send(Command::Backend(BackendCommand::Unknown))
+            .await
+        {
+            error!(
+                "Failed to send Unknown command to internal channel: {}",
+                send_err
+            );
+        }
+
         Ok(())
     }
 }
@@ -355,7 +370,7 @@ pub async fn start_communication_loop(
     }
 
     // Create channels for communication
-    let (backend_command_tx, mut backend_command_rx) = mpsc::channel::<BackendCommand>(32);
+    let (backend_command_tx, mut backend_command_rx) = mpsc::channel::<Command>(32);
     let (outgoing_responses_tx, outgoing_responses_rx) = mpsc::channel::<Message>(32);
 
     // Initialize Network struct with updated config
