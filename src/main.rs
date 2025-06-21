@@ -8,6 +8,7 @@ use tokio::signal;
 // Backend WebSocket URL configuration
 // const WS_URL: &str = "wss://wss.project-yourcloud.me";
 const WS_URL: &str = "wss://localhost:4200";
+
 // Declare modules
 mod commands;
 mod config;
