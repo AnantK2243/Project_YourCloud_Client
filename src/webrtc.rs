@@ -45,6 +45,10 @@ pub struct WebRTCSession {
     pub file_metadata: serde_json::Value,
     pub created_at: std::time::Instant,
     pub pending_chunk_id: Arc<Mutex<Option<String>>>,
+    pub pending_chunk_buffer: Arc<Mutex<Vec<u8>>>,
+    pub expected_chunk_size: Arc<Mutex<Option<usize>>>,
+    pub expected_total_parts: Arc<Mutex<Option<usize>>>,
+    pub received_parts: Arc<Mutex<usize>>,
 }
 
 pub struct WebRTCManager {
@@ -86,12 +90,20 @@ impl WebRTCManager {
 
         // Create ICE configuration
         let config = RTCConfiguration {
-            ice_servers: vec![RTCIceServer {
-                urls: vec!["stun:172.31.127.22:3478".to_string()],
-                username: String::new(),
-                credential: String::new(),
-                ..Default::default()
-            }],
+            ice_servers: vec![
+                RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                    username: String::new(),
+                    credential: String::new(),
+                    ..Default::default()
+                },
+                RTCIceServer {
+                    urls: vec!["stun:stun1.l.google.com:19302".to_string()],
+                    username: String::new(),
+                    credential: String::new(),
+                    ..Default::default()
+                },
+            ],
             ice_transport_policy: RTCIceTransportPolicy::All,
             bundle_policy: RTCBundlePolicy::Balanced,
             rtcp_mux_policy: RTCRtcpMuxPolicy::Require,
@@ -217,6 +229,10 @@ impl WebRTCManager {
             file_metadata,
             created_at: std::time::Instant::now(),
             pending_chunk_id: Arc::new(Mutex::new(None)),
+            pending_chunk_buffer: Arc::new(Mutex::new(Vec::new())),
+            expected_chunk_size: Arc::new(Mutex::new(None)),
+            expected_total_parts: Arc::new(Mutex::new(None)),
+            received_parts: Arc::new(Mutex::new(0)),
         };
 
         {
@@ -342,13 +358,37 @@ async fn handle_data_channel_message(
         // Try to parse as JSON chunk metadata
         if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(chunk_id) = metadata.get("chunk_id").and_then(|v| v.as_str()) {
-                // This is chunk metadata - store it for the next binary message
+                // This is chunk metadata - initialize multi-part reception
                 if let Some(session) = WEBRTC_MANAGER.get_session(session_id).await {
-                    let mut pending = session.pending_chunk_id.lock().await;
-                    *pending = Some(chunk_id.to_string());
+                    let expected_size = metadata.get("size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let total_parts = metadata.get("total_parts").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                    
+                    // Initialize chunk reassembly state
+                    {
+                        let mut pending_id = session.pending_chunk_id.lock().await;
+                        *pending_id = Some(chunk_id.to_string());
+                    }
+                    {
+                        let mut buffer = session.pending_chunk_buffer.lock().await;
+                        buffer.clear();
+                        buffer.reserve(expected_size);
+                    }
+                    {
+                        let mut expected_chunk_size = session.expected_chunk_size.lock().await;
+                        *expected_chunk_size = Some(expected_size);
+                    }
+                    {
+                        let mut expected_total_parts = session.expected_total_parts.lock().await;
+                        *expected_total_parts = Some(total_parts);
+                    }
+                    {
+                        let mut received_parts = session.received_parts.lock().await;
+                        *received_parts = 0;
+                    }
+
                     debug!(
-                        "Received chunk metadata via WebRTC: {} for session: {}",
-                        chunk_id, session_id
+                        "Received chunk metadata via WebRTC: {} (size: {}, parts: {}) for session: {}",
+                        chunk_id, expected_size, total_parts, session_id
                     );
 
                     // Send acknowledgment
@@ -361,23 +401,165 @@ async fn handle_data_channel_message(
         }
     }
 
-    // This is binary data - get the pending chunk ID
-    let chunk_id = if let Some(session) = WEBRTC_MANAGER.get_session(session_id).await {
-        let mut pending = session.pending_chunk_id.lock().await;
-        if let Some(id) = pending.take() {
-            id
-        } else {
-            // No pending chunk ID - error out as fallback
-            error!(
-                "Received binary data without pending chunk ID for session: {}",
+    // This is binary data - handle chunk part
+    if let Some(session) = WEBRTC_MANAGER.get_session(session_id).await {
+        let chunk_id = {
+            let pending = session.pending_chunk_id.lock().await;
+            if let Some(id) = pending.as_ref() {
+                id.clone()
+            } else {
+                error!(
+                    "Received binary data without pending chunk ID for session: {}",
+                    session_id
+                );
+                let response = "ERROR:No chunk ID provided for binary data";
+                if let Err(e) = data_channel.send_text(response.to_string()).await {
+                    error!("Failed to send error response: {}", e);
+                }
+                return Err(anyhow!("Binary data received without pending chunk ID"));
+            }
+        };
+
+        // Add this part to the buffer
+        {
+            let mut buffer = session.pending_chunk_buffer.lock().await;
+            buffer.extend_from_slice(&data);
+        }
+
+        // Increment received parts counter
+        let (current_parts, expected_parts, expected_size) = {
+            let mut received_parts = session.received_parts.lock().await;
+            *received_parts += 1;
+            let current = *received_parts;
+            
+            let expected_parts = session.expected_total_parts.lock().await;
+            let expected_size = session.expected_chunk_size.lock().await;
+            
+            (current, expected_parts.unwrap_or(1), expected_size.unwrap_or(0))
+        };
+
+        debug!(
+            "Received chunk part {}/{} for chunk {} ({} bytes) in session: {}",
+            current_parts, expected_parts, chunk_id, data.len(), session_id
+        );
+
+        // Check if we have all parts
+        if current_parts >= expected_parts {
+            // Get the complete chunk data
+            let complete_chunk_data = {
+                let buffer = session.pending_chunk_buffer.lock().await;
+                buffer.clone()
+            };
+
+            // Validate expected size
+            if expected_size > 0 && complete_chunk_data.len() != expected_size {
+                let error_msg = format!(
+                    "Chunk size mismatch: expected {}, got {} bytes",
+                    expected_size, complete_chunk_data.len()
+                );
+                error!("{}", error_msg);
+                let response = format!("ERROR:{}", error_msg);
+                if let Err(e) = data_channel.send_text(response).await {
+                    error!("Failed to send error response: {}", e);
+                }
+                return Err(anyhow!(error_msg));
+            }
+
+            debug!(
+                "Reassembled complete chunk via WebRTC: {} ({} bytes) for session: {}",
+                chunk_id,
+                complete_chunk_data.len(),
                 session_id
             );
-            let response = "ERROR:No chunk ID provided for binary data";
-            if let Err(e) = data_channel.send_text(response.to_string()).await {
-                error!("Failed to send error response: {}", e);
+
+            // Store the complete chunk
+            match storage::store_chunk_data_to_disk(
+                storage_path,
+                &chunk_id,
+                &complete_chunk_data,
+                current_used_space_bytes,
+                max_storage_bytes,
+                current_chunk_count,
+            )
+            .await
+            {
+                Ok(chunk_size) => {
+                    info!(
+                        "Successfully stored reassembled chunk {} ({} bytes) via WebRTC",
+                        chunk_id, chunk_size
+                    );
+
+                    // Clean up session state
+                    {
+                        let mut pending_id = session.pending_chunk_id.lock().await;
+                        *pending_id = None;
+                    }
+                    {
+                        let mut buffer = session.pending_chunk_buffer.lock().await;
+                        buffer.clear();
+                    }
+                    {
+                        let mut expected_chunk_size = session.expected_chunk_size.lock().await;
+                        *expected_chunk_size = None;
+                    }
+                    {
+                        let mut expected_total_parts = session.expected_total_parts.lock().await;
+                        *expected_total_parts = None;
+                    }
+                    {
+                        let mut received_parts = session.received_parts.lock().await;
+                        *received_parts = 0;
+                    }
+
+                    // Send simple text response with chunk ID
+                    let response = format!("STORED:{}", chunk_id);
+                    if let Err(e) = data_channel.send_text(response).await {
+                        error!(
+                            "Failed to send success response for chunk {}: {}",
+                            chunk_id, e
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to store chunk {} via WebRTC: {}", chunk_id, e);
+
+                    // Clean up session state on error
+                    {
+                        let mut pending_id = session.pending_chunk_id.lock().await;
+                        *pending_id = None;
+                    }
+                    {
+                        let mut buffer = session.pending_chunk_buffer.lock().await;
+                        buffer.clear();
+                    }
+                    {
+                        let mut expected_chunk_size = session.expected_chunk_size.lock().await;
+                        *expected_chunk_size = None;
+                    }
+                    {
+                        let mut expected_total_parts = session.expected_total_parts.lock().await;
+                        *expected_total_parts = None;
+                    }
+                    {
+                        let mut received_parts = session.received_parts.lock().await;
+                        *received_parts = 0;
+                    }
+
+                    // Send simple error response
+                    let response = format!("ERROR:{}", e);
+                    if let Err(send_err) = data_channel.send_text(response).await {
+                        error!(
+                            "Failed to send error response for chunk {}: {}",
+                            chunk_id, send_err
+                        );
+                    }
+
+                    return Err(e);
+                }
             }
-            return Err(anyhow!("Binary data received without pending chunk ID"));
         }
+        // If not all parts received yet, just continue waiting
+        
     } else {
         // No session - error out
         error!("Received binary data for unknown session: {}", session_id);
@@ -386,54 +568,6 @@ async fn handle_data_channel_message(
             error!("Failed to send error response: {}", e);
         }
         return Err(anyhow!("Binary data received for unknown session"));
-    };
-
-    debug!(
-        "Storing encrypted chunk via WebRTC: {} ({} bytes) for session: {}",
-        chunk_id,
-        data.len(),
-        session_id
-    );
-
-    match storage::store_chunk_data_to_disk(
-        storage_path,
-        &chunk_id,
-        &data,
-        current_used_space_bytes,
-        max_storage_bytes,
-        current_chunk_count,
-    )
-    .await
-    {
-        Ok(chunk_size) => {
-            info!(
-                "Successfully stored chunk {} ({} bytes) via WebRTC",
-                chunk_id, chunk_size
-            );
-
-            // Send simple text response with chunk ID
-            let response = format!("STORED:{}", chunk_id);
-            if let Err(e) = data_channel.send_text(response).await {
-                error!(
-                    "Failed to send success response for chunk {}: {}",
-                    chunk_id, e
-                );
-            }
-        }
-        Err(e) => {
-            error!("Failed to store chunk {} via WebRTC: {}", chunk_id, e);
-
-            // Send simple error response
-            let response = format!("ERROR:{}", e);
-            if let Err(send_err) = data_channel.send_text(response).await {
-                error!(
-                    "Failed to send error response for chunk {}: {}",
-                    chunk_id, send_err
-                );
-            }
-
-            return Err(e);
-        }
     }
 
     Ok(())
