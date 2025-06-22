@@ -472,6 +472,29 @@ pub async fn send_status_report<S: Serialize>(
     Ok(())
 }
 
+pub async fn send_check_response(
+    response_tx: &mpsc::Sender<Message>,
+    command_id: String,
+    exists: bool,
+) -> Result<()> {
+    // Create a response that includes the chunk existence in a data field
+    let response_data = serde_json::json!({
+        "type": "COMMAND_RESULT",
+        "command_id": command_id,
+        "success": true,
+        "error": null,
+        "storage_delta": null,
+        "chunk_exists": exists
+    });
+
+    let response_text = response_data.to_string();
+
+    response_tx
+        .send(Message::Text(response_text))
+        .await
+        .context("Failed to send check response")?;
+    Ok(())
+}
 
 pub async fn send_chunk_data(
     response_tx: &mpsc::Sender<Message>,

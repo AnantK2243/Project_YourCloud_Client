@@ -247,3 +247,18 @@ pub async fn delete_chunk_from_disk(
         )),
     }
 }
+
+pub async fn check_chunk_exists(
+    storage_path_base: &Path,
+    chunk_id: &str,
+) -> Result<bool> {
+    let chunk_path = storage_path_base.join(chunk_id);
+    match tokio::fs::try_exists(&chunk_path).await {
+        Ok(exists) => Ok(exists),
+        Err(e) => Err(anyhow!(
+            "Error checking existence of chunk {}: {}",
+            chunk_id,
+            e
+        )),
+    }
+}

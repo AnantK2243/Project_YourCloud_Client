@@ -35,6 +35,10 @@ pub enum BackendCommand {
         command_id: String,
         chunk_id: String,
     },
+    CheckChunk {
+        command_id: String,
+        chunk_id: String,
+    },
     StatusRequest {
         command_id: String,
     },
@@ -139,6 +143,23 @@ pub async fn handle_command(
                 Ok(None) => {
                     // Chunk didn't exist, no storage change
                     send_result(&response_tx, command_id, Ok(()), None).await?;
+                }
+                Err(e) => {
+                    send_result(&response_tx, command_id, Err(e), None).await?;
+                }
+            }
+        }
+
+        // Check if chunk exists
+        BackendCommand::CheckChunk {
+            command_id,
+            chunk_id,
+        } => {
+            info!("Handling CheckChunk: {}", chunk_id);
+            let exists = storage::check_chunk_exists(&storage_path, &chunk_id).await;
+            match exists {
+                Ok(found) => {
+                    network::send_check_response(&response_tx, command_id, found).await?;
                 }
                 Err(e) => {
                     send_result(&response_tx, command_id, Err(e), None).await?;
