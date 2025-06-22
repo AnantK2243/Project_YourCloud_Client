@@ -5,15 +5,16 @@ use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Duration};
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{connect_async, connect_async_tls_with_config, Connector};
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::{connect_async_with_config, connect_async_tls_with_config, Connector};
 
 #[derive(Serialize)]
 struct CommandResult<'a> {
@@ -32,11 +33,56 @@ struct StatusReport<'a, S: Serialize> {
     status: S,
 }
 
+// Structure to track partial frames being reconstructed
+#[derive(Debug)]
+#[allow(dead_code)]
+struct PartialFrame {
+    command_id: String,
+    frame_id: String,
+    total_frames: u32,
+    received_frames: HashMap<u32, Vec<u8>>,
+    received_count: u32,
+}
+
+impl PartialFrame {
+    fn new(command_id: String, frame_id: String, total_frames: u32) -> Self {
+        Self {
+            command_id,
+            frame_id,
+            total_frames,
+            received_frames: HashMap::new(),
+            received_count: 0,
+        }
+    }
+    
+    fn add_frame(&mut self, frame_number: u32, data: Vec<u8>) -> bool {
+        if self.received_frames.insert(frame_number, data).is_none() {
+            self.received_count += 1;
+        }
+        self.received_count == self.total_frames
+    }
+    
+    fn reconstruct(&self) -> Result<Vec<u8>> {
+        let mut result = Vec::new();
+        
+        for i in 1..=self.total_frames {
+            if let Some(frame_data) = self.received_frames.get(&i) {
+                result.extend_from_slice(frame_data);
+            } else {
+                return Err(anyhow!("Missing frame {} of {}", i, self.total_frames));
+            }
+        }
+        
+        Ok(result)
+    }
+}
+
 pub struct Network {
     ws_url: String,
     auth_token: String,
     node_id: String,
     command_sender: mpsc::Sender<BackendCommand>,
+    partial_frames: Arc<Mutex<HashMap<String, PartialFrame>>>,
 }
 
 impl Network {
@@ -51,6 +97,7 @@ impl Network {
             auth_token,
             node_id,
             command_sender,
+            partial_frames: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -96,6 +143,13 @@ impl Network {
         &self,
         outgoing_responses_rx: &mut mpsc::Receiver<Message>,
     ) -> Result<()> {
+        // Configure WebSocket
+        let ws_config = WebSocketConfig {
+            max_message_size: Some(64 * 1024 * 1024), // 64MB
+            max_frame_size: Some(64 * 1024 * 1024),
+            ..Default::default()
+        };
+
         let (ws_stream, response) = if self.ws_url.starts_with("wss://") {
             // Create TLS connector that accepts invalid certificates for self-signed certs
             let native_tls_connector = native_tls::TlsConnector::builder()
@@ -106,13 +160,13 @@ impl Network {
 
             let connector = Connector::NativeTls(native_tls_connector);
 
-            connect_async_tls_with_config(&self.ws_url, None, false, Some(connector))
+            connect_async_tls_with_config(&self.ws_url, Some(ws_config), false, Some(connector))
                 .await
                 .with_context(|| {
                     format!("Failed to connect to backend WebSocket: {}", self.ws_url)
                 })?
         } else {
-            connect_async(&self.ws_url).await.with_context(|| {
+            connect_async_with_config(&self.ws_url, Some(ws_config), false).await.with_context(|| {
                 format!("Failed to connect to backend WebSocket: {}", self.ws_url)
             })?
         };
@@ -186,14 +240,18 @@ impl Network {
                             match message {
                                 // Process command recieved
                                 Message::Text(command) => {
-                                    debug!("Received Command: {}", command);
                                     if let Err(e) = self.process_message(command).await {
                                         error!("Error processing incoming message: {}", e);
                                     }
                                 }
 
-                                // Other possible responses, not usual for use
-                                Message::Binary(_) => warn!("Received binary message, which is not currently processed."),
+                                // Handle combined binary messages
+                                Message::Binary(data) => {
+                                    if let Err(e) = self.process_binary_message(data).await {
+                                        error!("Error processing combined binary message: {}", e);
+                                    }
+                                }
+                                // Other message types
                                 Message::Ping(ping_data) => {
                                     debug!("Received Ping, sending Pong.");
                                     if let Err(e) = ws_sender.send(Message::Pong(ping_data)).await {
@@ -256,6 +314,116 @@ impl Network {
         }
         Ok(())
     }
+
+    async fn process_binary_message(&self, binary_data: Vec<u8>) -> Result<()> {
+        if binary_data.len() < 4 {
+            return Err(anyhow!("Binary message too short for header"));
+        }
+
+        // Read JSON length (first 4 bytes, little-endian)
+        let json_length = u32::from_le_bytes([
+            binary_data[0], 
+            binary_data[1], 
+            binary_data[2], 
+            binary_data[3]
+        ]) as usize;
+
+        if binary_data.len() < 4 + json_length {
+            return Err(anyhow!("Binary message too short for JSON data"));
+        }
+
+        // Extract JSON command
+        #[derive(Deserialize)]
+        struct ParsedJson {
+            command_type: String,
+            chunk_id: String,
+            data_size: u64,
+            command_id: String,
+            frame_number: Option<u32>,
+            total_frames: Option<u32>,
+        }
+
+        let json_data = &binary_data[4..4 + json_length];
+        let command: ParsedJson = serde_json::from_slice(json_data)
+            .context("Failed to parse JSON command from binary message")?;
+
+        // Only STORE_CHUNK commands use binary data
+        if command.command_type != "STORE_CHUNK" {
+            return Err(anyhow!("Unsupported command type: {}", command.command_type));
+        }
+
+        // Extract binary payload
+        let binary_payload = if binary_data.len() > 4 + json_length {
+            binary_data[4 + json_length..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let final_binary_data = if let (Some(frame_number), Some(total_frames)) = 
+            (command.frame_number, command.total_frames) {
+            
+            if total_frames == 1 {
+                // Single frame, process immediately
+                binary_payload
+            } else {
+                // Multi-frame message - reconstruct
+                let mut partial_frames = self.partial_frames.lock().await;
+                let frame_key = format!("{}_{}", command.command_id, command.chunk_id);
+                
+                // Get or create partial frame entry
+                let partial_frame = partial_frames.entry(frame_key.clone()).or_insert_with(|| {
+                    PartialFrame::new(
+                        command.command_id.clone(),
+                        command.chunk_id.clone(),
+                        total_frames,
+                    )
+                });
+                
+                // Add this frame
+                let is_complete = partial_frame.add_frame(frame_number, binary_payload);
+                
+                if is_complete {
+                    let reconstructed = partial_frame.reconstruct()
+                        .context("Failed to reconstruct framed data")?;
+                    
+                    // Remove completed frame from tracking
+                    partial_frames.remove(&frame_key);
+                    
+                    reconstructed
+                } else {
+                    return Ok(());
+                }
+            }
+        } else {
+            binary_payload
+        };
+
+        // Check size of final binary data
+        if final_binary_data.len() as u64 != command.data_size {
+            return Err(anyhow!("Binary data size mismatch: expected {}, got {}", command.data_size, final_binary_data.len() as u64));
+        }
+
+        // Create the BackendCommand based on the parsed JSON
+        let command = BackendCommand::StoreChunk {
+            command_id: command.command_id,
+            chunk_id: command.chunk_id,
+            data_size: command.data_size,
+            binary_data: if final_binary_data.is_empty() {
+                None
+            } else {
+                Some(final_binary_data)
+            },
+        };
+
+        // Send to command handler
+        if let Err(e) = self.command_sender.send(command).await {
+            error!("Failed to send command to handler: {}", e);
+            return Err(e.into());
+        }
+
+        Ok(())
+    }
+
 }
 
 // Public functions to be called by commands::handle_command to send responses
@@ -304,33 +472,83 @@ pub async fn send_status_report<S: Serialize>(
     Ok(())
 }
 
-#[derive(Serialize)]
-struct ChunkDataResponse<'a> {
-    r#type: &'a str,
-    command_id: &'a str,
-    success: bool,
-    data: String, // Base64 encoded chunk data
-}
 
 pub async fn send_chunk_data(
     response_tx: &mpsc::Sender<Message>,
     command_id: String,
-    encoded_data: String,
+    binary_data: Vec<u8>,
 ) -> Result<()> {
-    let response = ChunkDataResponse {
-        r#type: "COMMAND_RESULT",
-        command_id: &command_id,
-        success: true,
-        data: encoded_data,
-    };
+    // Define max frame size for binary data (8MB)
+    const MAX_BINARY_FRAME_SIZE: usize = 8 * 1024 * 1024; // 8MB
 
-    let response_text =
-        serde_json::to_string(&response).context("Failed to serialize chunk data response")?;
+    if binary_data.len() <= MAX_BINARY_FRAME_SIZE {
+        // Send as single frame
+        send_chunk_frame(response_tx, &command_id, &binary_data, 1, 1).await?;
+    } else {
+        // Split into multiple frames
+        let total_frames = (binary_data.len() + MAX_BINARY_FRAME_SIZE - 1) / MAX_BINARY_FRAME_SIZE;
 
+        for frame_number in 1..=total_frames {
+            let start = (frame_number - 1) * MAX_BINARY_FRAME_SIZE;
+            let end = std::cmp::min(start + MAX_BINARY_FRAME_SIZE, binary_data.len());
+            let frame_data = &binary_data[start..end];
+
+            send_chunk_frame(response_tx, &command_id, frame_data, frame_number, total_frames).await?;
+
+            // Small delay between frames to prevent overwhelming the server
+            if frame_number < total_frames {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Helper function to send a single chunk frame
+async fn send_chunk_frame(
+    response_tx: &mpsc::Sender<Message>,
+    command_id: &str,
+    binary_data: &[u8],
+    frame_number: usize,
+    total_frames: usize,
+) -> Result<()> {
+    // Create response header with frame info
+    let mut response_header = serde_json::json!({
+        "type": "GET_CHUNK_RESULT",
+        "command_id": command_id,
+        "success": true,
+        "data_size": binary_data.len()
+    });
+
+    // Add frame info for multi-frame responses
+    if total_frames > 1 {
+        response_header["frame_number"] = serde_json::Value::Number(serde_json::Number::from(frame_number));
+        response_header["total_frames"] = serde_json::Value::Number(serde_json::Number::from(total_frames));
+    }
+    
+    let header_json = serde_json::to_string(&response_header)
+        .context("Failed to serialize chunk response header")?;
+    let header_bytes = header_json.as_bytes();
+    
+    // Create combined message: [4 bytes: json_length][json_header][binary_data]
+    let mut combined_message = Vec::with_capacity(4 + header_bytes.len() + binary_data.len());
+    
+    // Write JSON header length (4 bytes, little-endian)
+    combined_message.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+    
+    // Write JSON header
+    combined_message.extend_from_slice(header_bytes);
+    
+    // Write binary data
+    combined_message.extend_from_slice(binary_data);
+    
+    // Send as binary WebSocket message
     response_tx
-        .send(Message::Text(response_text))
+        .send(Message::Binary(combined_message))
         .await
-        .context("Failed to send chunk data")?;
+        .context("Failed to send binary chunk frame")?;
+        
     Ok(())
 }
 

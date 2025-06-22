@@ -3,7 +3,6 @@
 use crate::network;
 use crate::storage;
 use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose, Engine as _};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicU64;
@@ -25,7 +24,8 @@ pub enum BackendCommand {
     StoreChunk {
         command_id: String,
         chunk_id: String,
-        data: String,
+        data_size: u64,
+        binary_data: Option<Vec<u8>>,
     },
     GetChunk {
         command_id: String,
@@ -51,45 +51,48 @@ pub async fn handle_command(
     current_chunk_count: Arc<AtomicU64>,
 ) -> Result<()> {
     match command {
-        // Store chunk data directly
+        // Store chunk data
         BackendCommand::StoreChunk {
             command_id,
             chunk_id,
-            data,
+            data_size,
+            binary_data,
         } => {
-            info!("Handling StoreChunk: {}", chunk_id);
+            info!("Handling StoreChunk: {} ({} bytes)", chunk_id, data_size);
 
-            // Decode base64 data
-            let result = match general_purpose::STANDARD.decode(&data) {
-                Ok(chunk_data) => {
-                    match storage::store_chunk_data_to_disk(
-                        &storage_path,
-                        &chunk_id,
-                        &chunk_data,
-                        &current_used_space_bytes,
-                        &max_storage_bytes,
-                        &current_chunk_count,
-                    )
-                    .await
-                    {
-                        Ok(chunk_size) => {
-                            // Send positive storage delta for stored chunk
-                            send_result(&response_tx, command_id, Ok(()), Some(chunk_size as i64))
-                                .await?;
-                        }
-                        Err(e) => {
-                            send_result(&response_tx, command_id, Err(e), None).await?;
+            let result = match binary_data {
+                Some(chunk_data) => {
+                    // Verify data size matches expected
+                    if chunk_data.len() != data_size as usize {
+                        Err(anyhow!("Binary data size mismatch: expected {}, got {}", data_size, chunk_data.len()))
+                    } else {
+                        match storage::store_chunk_data_to_disk(
+                            &storage_path,
+                            &chunk_id,
+                            &chunk_data,
+                            &current_used_space_bytes,
+                            &max_storage_bytes,
+                            &current_chunk_count,
+                        )
+                        .await
+                        {
+                            Ok(chunk_size) => {
+                                // Send positive storage delta for stored chunk
+                                send_result(&response_tx, command_id, Ok(()), Some(chunk_size as i64))
+                                    .await?;
+                                return Ok(());
+                            }
+                            Err(e) => Err(e),
                         }
                     }
-                    return Ok(());
                 }
-                Err(e) => Err(anyhow!("Failed to decode base64 data: {}", e)),
+                None => Err(anyhow!("No binary data provided for STORE_CHUNK command")),
             };
 
             send_result(&response_tx, command_id, result, None).await?;
         }
 
-        // Get chunk and return data directly
+        // Get chunk and return binary data
         BackendCommand::GetChunk {
             command_id,
             chunk_id,
@@ -100,9 +103,7 @@ pub async fn handle_command(
 
             match result {
                 Ok(chunk_data) => {
-                    // Encode data as base64 and send back
-                    let encoded_data = general_purpose::STANDARD.encode(&chunk_data);
-                    network::send_chunk_data(&response_tx, command_id, encoded_data).await?;
+                    network::send_chunk_data(&response_tx, command_id, chunk_data).await?;
                 }
                 Err(e) => {
                     send_result(&response_tx, command_id, Err(e), None).await?;
