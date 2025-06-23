@@ -35,7 +35,6 @@ async fn main() -> Result<()> {
     info!("Configuration loaded successfully");
 
     // Validate configuration
-    info!("Ensuring storage path exists: {:?}", config.storage_path);
     fs::create_dir_all(&config.storage_path)
         .await
         .with_context(|| {
@@ -44,10 +43,10 @@ async fn main() -> Result<()> {
                 config.storage_path
             )
         })?;
-    info!("Storage path exists.");
+    info!("Storage path: {:?} exists.", config.storage_path);
 
     // Check available system disk space
-    let configured_max_bytes = config.max_storage_gib * 1024 * 1024 * 1024;
+    let configured_max_bytes = (config.max_storage_gib * 1024.0 * 1024.0 * 1024.0) as u64;
     // Call the function from the storage module
     match get_disk_available_space(&config.storage_path) {
         Ok(available_system_space) => {
@@ -60,7 +59,6 @@ async fn main() -> Result<()> {
                     "Not enough disk space to meet configured max_storage_gib."
                 ));
             }
-            info!("Sufficient disk space available.");
         }
         Err(e) => {
             error!("Could not verify available disk space: {}", e);

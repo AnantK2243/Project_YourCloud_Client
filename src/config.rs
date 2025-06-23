@@ -1,6 +1,6 @@
 // src/config.rs
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use dirs;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -13,18 +13,15 @@ pub struct Config {
     pub node_id: String,
     pub auth_token: String,
     pub storage_path: PathBuf,
-    pub max_storage_gib: u64,
+    pub max_storage_gib: f64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        info!("Creating default configuration");
-
         // Generate default user storage folder
         let default_storage_path = dirs::home_dir()
             .map(|mut path| {
                 path.push("Project_YourCloud");
-                info!("Using home directory for default storage: {:?}", path);
                 path
             })
             .or_else(|| {
@@ -55,7 +52,7 @@ impl Default for Config {
             node_id: String::new(),
             auth_token: String::new(),
             storage_path: default_storage_path,
-            max_storage_gib: 20,
+            max_storage_gib: 20.0,
         }
     }
 }
@@ -66,19 +63,30 @@ pub async fn load_config() -> Result<Config> {
 
     // First time run, create default config file at path
     if !config_path.exists() {
-        info!(
+        warn!(
             "Config file not found, creating default at: {:?}",
             config_path
         );
         let default_config = Config::default();
         save_config(&default_config).await?;
-        info!("Default config file created successfully");
 
-        // Return default config
-        return Ok(default_config);
+        // Display warning and stop the program
+        warn!("========================================");
+        warn!("DEFAULT CONFIGURATION CREATED");
+        warn!("========================================");
+        warn!(
+            "A default configuration file has been created at: {:?}",
+            config_path
+        );
+        warn!(
+            "Please edit this file to configure your node_id and auth_token before running again."
+        );
+        warn!("You can register your node through the web interface to obtain these credentials.");
+        warn!("Program will now exit.");
+        warn!("========================================");
+
+        return Err(anyhow!("Default configuration created. Please configure node_id and auth_token before running again."));
     }
-
-    info!("Config file found, reading from: {:?}", config_path);
 
     // Read and return
     let config_content = fs::read_to_string(&config_path)
@@ -92,13 +100,12 @@ pub async fn load_config() -> Result<Config> {
         pub node_id: String,
         pub auth_token: String,
         pub storage_path: PathBuf,
-        pub max_storage_gib: u64,
+        pub max_storage_gib: f64,
     }
 
     let file_config: FileConfig =
         toml::from_str(&config_content).context("Failed to parse config file")?;
 
-    info!("Config file parsed successfully");
     debug!(
         "Loaded config - node_id: {}, storage_path: {:?}, max_storage: {} GiB",
         file_config.node_id, file_config.storage_path, file_config.max_storage_gib
@@ -112,13 +119,11 @@ pub async fn load_config() -> Result<Config> {
     };
 
     validate_config(&config)?;
-    info!("Configuration validation passed");
     Ok(config)
 }
 
 pub async fn save_config(config: &Config) -> Result<()> {
     let config_path = get_config_path()?;
-    info!("Saving configuration to: {:?}", config_path);
 
     // Create parent directories if they don't exist
     if let Some(parent) = config_path.parent() {
@@ -134,7 +139,7 @@ pub async fn save_config(config: &Config) -> Result<()> {
         pub node_id: String,
         pub auth_token: String,
         pub storage_path: PathBuf,
-        pub max_storage_gib: u64,
+        pub max_storage_gib: f64,
     }
 
     let save_config = SaveConfig {
@@ -153,7 +158,6 @@ pub async fn save_config(config: &Config) -> Result<()> {
         .await
         .context("Failed to write config file")?;
 
-    info!("Configuration saved successfully to: {:?}", config_path);
     Ok(())
 }
 
@@ -191,18 +195,68 @@ fn validate_config(config: &Config) -> Result<()> {
     }
     debug!("Storage path validation passed: {:?}", config.storage_path);
 
-    // Config storage misconfigured
-    if config.max_storage_gib <= 0 {
+    // Config storage misconfigured - add upper bound check
+    if config.max_storage_gib == 0.0 {
         error!(
             "Invalid max_storage_gib: must be > 0, got: {}",
             config.max_storage_gib
         );
         return Err(anyhow::anyhow!("max_storage_gib must be greater than 0"));
     }
+
+    // Check for excessively large storage values that could cause overflow
+    const MAX_REASONABLE_GIB: f64 = 1024.0 * 1024.0;
+    if config.max_storage_gib > MAX_REASONABLE_GIB {
+        error!(
+            "Invalid max_storage_gib: too large, got: {} GiB (max: {} GiB)",
+            config.max_storage_gib, MAX_REASONABLE_GIB
+        );
+        return Err(anyhow::anyhow!(
+            "max_storage_gib is too large: {} GiB (maximum allowed: {} GiB)",
+            config.max_storage_gib,
+            MAX_REASONABLE_GIB
+        ));
+    }
+
+    // Validate the storage path doesn't contain dangerous characters
+    let path_str = config.storage_path.to_string_lossy();
+    if path_str.contains("..") {
+        error!(
+            "Storage path contains path traversal: {:?}",
+            config.storage_path
+        );
+        return Err(anyhow::anyhow!(
+            "storage_path contains invalid path traversal sequences"
+        ));
+    }
+
     debug!(
         "Max storage validation passed: {} GiB",
         config.max_storage_gib
     );
+
+    // Validate node_id and auth_token if they're set
+    if !config.node_id.is_empty() {
+        if config.node_id.len() > 255 {
+            return Err(anyhow::anyhow!("node_id is too long (max 255 characters)"));
+        }
+        // Basic validation for node_id format
+        if !config
+            .node_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(anyhow::anyhow!("node_id contains invalid characters (only alphanumeric, hyphens, and underscores allowed)"));
+        }
+    }
+
+    if !config.auth_token.is_empty() {
+        if config.auth_token.len() > 1024 {
+            return Err(anyhow::anyhow!(
+                "auth_token is too long (max 1024 characters)"
+            ));
+        }
+    }
 
     debug!("Configuration validation completed successfully");
     Ok(())

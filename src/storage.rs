@@ -40,16 +40,6 @@ pub fn get_disk_available_space(storage_path: &Path) -> Result<u64> {
 
     // If a matching disk was found.
     if let Some(disk) = best_match_disk {
-        // log::info!(
-        //     "Storage path {:?} is on disk mounted at {:?} (Disk: {:?}, FS: {:?}, Total: {} bytes, Available: {} bytes)",
-        //     canonical_storage_path,
-        //     disk.mount_point(),
-        //     disk.name(),
-        //     disk.file_system(),
-        //     disk.total_space(),
-        //     disk.available_space()
-        // );
-
         // Returns the available space on the disk.
         Ok(disk.available_space())
     } else {
@@ -63,11 +53,13 @@ pub fn get_disk_available_space(storage_path: &Path) -> Result<u64> {
 
 pub async fn initialize_storage_state(
     storage_path_base: &Path,
-    max_storage_gib: u64,
+    max_storage_gib: f64,
 ) -> Result<(Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>)> {
     let current_used_space = Arc::new(AtomicU64::new(0));
     let current_chunk_count = Arc::new(AtomicU64::new(0));
-    let max_bytes = Arc::new(AtomicU64::new(max_storage_gib * 1024 * 1024 * 1024));
+    let max_bytes = Arc::new(AtomicU64::new(
+        (max_storage_gib * 1024.0 * 1024.0 * 1024.0) as u64,
+    ));
 
     // Check storage path existance
     if !storage_path_base.exists() {
@@ -107,15 +99,9 @@ pub async fn initialize_storage_state(
         }
     }
 
-    current_used_space.store(total_size, Ordering::SeqCst);
-    current_chunk_count.store(total_count, Ordering::SeqCst);
+    current_used_space.store(total_size, Ordering::Release);
+    current_chunk_count.store(total_count, Ordering::Release);
 
-    info!(
-        "Storage scan complete: Used: {} bytes, Max: {} bytes, Chunks: {}",
-        total_size,
-        max_bytes.load(Ordering::SeqCst),
-        total_count
-    );
     Ok((current_used_space, max_bytes, current_chunk_count))
 }
 
@@ -127,19 +113,28 @@ pub async fn store_chunk_data_to_disk(
     max_storage_bytes: &Arc<AtomicU64>,
     current_chunk_count: &Arc<AtomicU64>,
 ) -> Result<u64> {
-    let chunk_path = storage_path_base.join(chunk_id);
-
-    // Check for pre-existence
-    if tokio::fs::try_exists(&chunk_path).await.unwrap_or(false) {
-        warn!("Chunk {} already exists, refusing to overwrite.", chunk_id);
-        return Err(anyhow!("Chunk {} already exists.", chunk_id));
+    // Validate chunk_id for security
+    if chunk_id.is_empty() || chunk_id.len() > 255 {
+        return Err(anyhow!("Invalid chunk_id: empty or too long"));
     }
 
+    if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
+        return Err(anyhow!(
+            "Invalid chunk_id: contains path traversal characters"
+        ));
+    }
+
+    let chunk_path = storage_path_base.join(chunk_id);
     let chunk_size = chunk_data.len() as u64;
 
-    // Check user set storage limit
-    let current_max = max_storage_bytes.load(Ordering::Relaxed);
-    let current_used = current_used_space_bytes.load(Ordering::Relaxed);
+    // Validate chunk size is reasonable
+    if chunk_size > 1024 * 1024 * 1024 {
+        return Err(anyhow!("Chunk too large: {} bytes", chunk_size));
+    }
+
+    // Check user set storage limit with overflow protection
+    let current_max = max_storage_bytes.load(Ordering::Acquire);
+    let current_used = current_used_space_bytes.load(Ordering::Acquire);
 
     if current_used.saturating_add(chunk_size) > current_max {
         return Err(anyhow!(
@@ -168,20 +163,48 @@ pub async fn store_chunk_data_to_disk(
         }
     }
 
-    // Write chunk data to file
-    fs::write(&chunk_path, chunk_data)
-        .await
-        .with_context(|| format!("Failed to write chunk {} to disk", chunk_id))?;
+    // Use a temporary file and rename to ensure atomicity
+    let temp_path = storage_path_base.join(format!(".tmp_{}", chunk_id));
 
-    // Update counters
-    current_used_space_bytes.fetch_add(chunk_size, Ordering::Relaxed);
-    current_chunk_count.fetch_add(1, Ordering::Relaxed);
+    // Clean up any existing temp file
+    if let Err(e) = fs::remove_file(&temp_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                "Failed to clean up existing temp file {:?}: {}",
+                temp_path, e
+            );
+        }
+    }
 
-    info!(
-        "Successfully stored chunk {} ({} bytes)",
-        chunk_id, chunk_size
-    );
-    Ok(chunk_size)
+    // Write to temporary file first
+    match fs::write(&temp_path, chunk_data).await {
+        Ok(_) => {
+            // Atomically move temp file to final location
+            match fs::rename(&temp_path, &chunk_path).await {
+                Ok(_) => {
+                    // Update counters only after successful write
+                    current_used_space_bytes.fetch_add(chunk_size, Ordering::Acquire);
+                    current_chunk_count.fetch_add(1, Ordering::Acquire);
+                    Ok(chunk_size)
+                }
+                Err(e) => {
+                    // Clean up temp file if rename failed
+                    let _ = fs::remove_file(&temp_path).await;
+
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        Err(anyhow!("Chunk {} already exists", chunk_id))
+                    } else {
+                        Err(anyhow!("Failed to finalize chunk write: {}", e))
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // Clean up temp file if write failed
+            let _ = fs::remove_file(&temp_path).await;
+            Err(anyhow!("Failed to write chunk {} to disk: {}", chunk_id, e))
+        }
+    }
 }
 
 pub async fn retrieve_chunk_data_from_disk(
@@ -200,11 +223,6 @@ pub async fn retrieve_chunk_data_from_disk(
         .await
         .with_context(|| format!("Failed to read chunk {} from disk", chunk_id))?;
 
-    info!(
-        "Successfully retrieved chunk {} ({} bytes)",
-        chunk_id,
-        chunk_data.len()
-    );
     Ok(chunk_data)
 }
 
@@ -224,15 +242,8 @@ pub async fn delete_chunk_from_disk(
                 .await
                 .with_context(|| format!("Failed to delete chunk file: {:?}", chunk_path))?;
 
-            current_used_space_bytes.fetch_sub(size, Ordering::SeqCst);
-            current_chunk_count.fetch_sub(1, Ordering::SeqCst);
-            info!(
-                "Deleted chunk {}: {} bytes. New usage: {} bytes, {} chunks.",
-                chunk_id,
-                size,
-                current_used_space_bytes.load(Ordering::SeqCst),
-                current_chunk_count.load(Ordering::SeqCst)
-            );
+            current_used_space_bytes.fetch_sub(size, Ordering::Release);
+            current_chunk_count.fetch_sub(1, Ordering::Release);
 
             Ok(Some(size))
         }
@@ -248,10 +259,7 @@ pub async fn delete_chunk_from_disk(
     }
 }
 
-pub async fn check_chunk_exists(
-    storage_path_base: &Path,
-    chunk_id: &str,
-) -> Result<bool> {
+pub async fn check_chunk_exists(storage_path_base: &Path, chunk_id: &str) -> Result<bool> {
     let chunk_path = storage_path_base.join(chunk_id);
     match tokio::fs::try_exists(&chunk_path).await {
         Ok(exists) => Ok(exists),

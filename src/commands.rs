@@ -3,7 +3,7 @@
 use crate::network;
 use crate::storage;
 use anyhow::{anyhow, Result};
-use log::{error, info, warn};
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -62,13 +62,15 @@ pub async fn handle_command(
             data_size,
             binary_data,
         } => {
-            info!("Handling StoreChunk: {} ({} bytes)", chunk_id, data_size);
-
             let result = match binary_data {
                 Some(chunk_data) => {
                     // Verify data size matches expected
                     if chunk_data.len() != data_size as usize {
-                        Err(anyhow!("Binary data size mismatch: expected {}, got {}", data_size, chunk_data.len()))
+                        Err(anyhow!(
+                            "Binary data size mismatch: expected {}, got {}",
+                            data_size,
+                            chunk_data.len()
+                        ))
                     } else {
                         match storage::store_chunk_data_to_disk(
                             &storage_path,
@@ -82,8 +84,13 @@ pub async fn handle_command(
                         {
                             Ok(chunk_size) => {
                                 // Send positive storage delta for stored chunk
-                                send_result(&response_tx, command_id, Ok(()), Some(chunk_size as i64))
-                                    .await?;
+                                send_result(
+                                    &response_tx,
+                                    command_id,
+                                    Ok(()),
+                                    Some(chunk_size as i64),
+                                )
+                                .await?;
                                 return Ok(());
                             }
                             Err(e) => Err(e),
@@ -101,7 +108,28 @@ pub async fn handle_command(
             command_id,
             chunk_id,
         } => {
-            info!("Handling GetChunk: {}", chunk_id);
+            // Validate chunk_id
+            if chunk_id.is_empty() || chunk_id.len() > 255 {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: empty or too long")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
 
             let result = storage::retrieve_chunk_data_from_disk(&storage_path, &chunk_id).await;
 
@@ -120,7 +148,28 @@ pub async fn handle_command(
             command_id,
             chunk_id,
         } => {
-            info!("Handling DeleteChunk: {}", chunk_id);
+            // Validate chunk_id
+            if chunk_id.is_empty() || chunk_id.len() > 255 {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: empty or too long")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
 
             match storage::delete_chunk_from_disk(
                 &storage_path,
@@ -155,7 +204,29 @@ pub async fn handle_command(
             command_id,
             chunk_id,
         } => {
-            info!("Handling CheckChunk: {}", chunk_id);
+            // Validate chunk_id
+            if chunk_id.is_empty() || chunk_id.len() > 255 {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: empty or too long")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+
             let exists = storage::check_chunk_exists(&storage_path, &chunk_id).await;
             match exists {
                 Ok(found) => {
@@ -169,8 +240,6 @@ pub async fn handle_command(
 
         // Handle status request from server
         BackendCommand::StatusRequest { command_id } => {
-            info!("Handling StatusRequest");
-
             let status = NodeStatus {
                 used_space_bytes: current_used_space_bytes.load(Ordering::Relaxed),
                 max_space_bytes: max_storage_bytes.load(Ordering::Relaxed),
