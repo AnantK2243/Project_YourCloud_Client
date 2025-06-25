@@ -21,6 +21,12 @@ futures-util = "0.3"
 tokio-util = "0.7.15"
 native-tls = "0.2"
 base64 = "0.21"
+<<<<<<< Updated upstream
 webrtc = "0.11"
 sha2 = "0.10"
 once_cell = "1.19"
+=======
+webrtc = "0.10"
+lazy_static = "1.4"
+once_cell = "1.21.3"
+>>>>>>> Stashed changes

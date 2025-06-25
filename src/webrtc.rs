@@ -1,622 +1,298 @@
 // src/webrtc.rs
 
-use crate::storage;
 use anyhow::{anyhow, Result};
-use log::{debug, error, info, warn};
-use once_cell::sync::Lazy;
-use serde_json;
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{atomic::AtomicU64, Arc},
-};
-use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::tungstenite::protocol::Message;
-use webrtc::{
-    api::{
-        interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder,
-    },
-    data_channel::{data_channel_message::DataChannelMessage, RTCDataChannel},
-    ice_transport::ice_candidate::RTCIceCandidateInit,
-    ice_transport::ice_server::RTCIceServer,
-    interceptor::registry::Registry,
-    peer_connection::{
-        configuration::RTCConfiguration, 
-        peer_connection_state::RTCPeerConnectionState,
-        policy::{
-            bundle_policy::RTCBundlePolicy,
-            ice_transport_policy::RTCIceTransportPolicy,
-            rtcp_mux_policy::RTCRtcpMuxPolicy,
-        },
-        sdp::session_description::RTCSessionDescription, 
-        RTCPeerConnection,
-    },
-};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Weak};
+use tokio::sync::Mutex;
+use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
 
-// Global session manager
-static WEBRTC_MANAGER: Lazy<WebRTCManager> = Lazy::new(|| WebRTCManager::new());
+use crate::storage::{self, StorageState};
 
-#[allow(dead_code)]
+// Represents a temporary session for a chunk upload.
 #[derive(Debug, Clone)]
-pub struct WebRTCSession {
-    pub session_id: String,
-    pub user_id: String,
-    pub peer_connection: Arc<RTCPeerConnection>,
-    pub file_metadata: serde_json::Value,
-    pub created_at: std::time::Instant,
-    pub pending_chunk_id: Arc<Mutex<Option<String>>>,
-    pub pending_chunk_buffer: Arc<Mutex<Vec<u8>>>,
-    pub expected_chunk_size: Arc<Mutex<Option<usize>>>,
-    pub expected_total_parts: Arc<Mutex<Option<usize>>>,
-    pub received_parts: Arc<Mutex<usize>>,
+pub struct TransferSession {
+    pub chunk_id: String,
+    pub buffer: Vec<u8>,
 }
 
+// Defines the message protocol used over the WebRTC data channel.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ClientMessage {
+    // Messages received from client
+    Upload { chunk_id: String },
+    Download { chunk_id: String },
+    DeleteChunk { chunk_id: String },
+    CheckChunk { chunk_id: String },
+
+    // Can be received (on upload) or sent
+    TransferComplete { chunk_id: String },
+
+    // Messages sent to client
+    TransferError { chunk_id: String, error: String },
+    ChunkStatus { chunk_id: String, exists: bool },
+}
+
+// Manages a single WebRTC peer connection, its state, and data transfers.
 pub struct WebRTCManager {
-    sessions: Arc<Mutex<HashMap<String, WebRTCSession>>>,
+    pub peer_connection: Arc<RTCPeerConnection>,
+    // State needed for handling file operations, captured at creation time.
+    storage_path: PathBuf,
+    storage_state: Arc<StorageState>,
+    // State for managing concurrent uploads.
+    active_uploads: Arc<Mutex<HashMap<String, TransferSession>>>,
+    current_upload_chunk_id: Arc<Mutex<Option<String>>>,
+}
+
+async fn wait_for_data_channel_buffer(data_channel: &Arc<RTCDataChannel>) {
+    const HIGH_WATER_MARK: usize = 16 * 1024 * 1024; // 16MB
+    while data_channel.buffered_amount().await > HIGH_WATER_MARK {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tx = Some(tx);
+        data_channel.on_buffered_amount_low(Box::new(move || {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(());
+            }
+            Box::pin(async {})
+        })).await;
+        let _ = rx.await;
+    }
 }
 
 impl WebRTCManager {
-    pub fn new() -> Self {
-        Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
+    pub async fn new(storage_path: PathBuf, storage_state: Arc<StorageState>) -> Result<Arc<Self>> {
+        let pc = Arc::new(APIBuilder::new().build().new_peer_connection(RTCConfiguration::default()).await?);
 
-    pub async fn create_session(
-        &self,
-        session_id: String,
-        user_id: String,
-        file_metadata: serde_json::Value,
-        storage_path: PathBuf,
-        current_used_space_bytes: Arc<AtomicU64>,
-        max_storage_bytes: Arc<AtomicU64>,
-        current_chunk_count: Arc<AtomicU64>,
-        response_tx: mpsc::Sender<Message>,
-    ) -> Result<()> {
-        info!("Creating WebRTC session: {}", session_id);
-
-        // Create MediaEngine and register codecs
-        let mut m = MediaEngine::default();
-
-        // Create a InterceptorRegistry
-        let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut m)?;
-
-        // Create the API object
-        let api = APIBuilder::new()
-            .with_media_engine(m)
-            .with_interceptor_registry(registry)
-            .build();
-
-        // Create ICE configuration
-        let config = RTCConfiguration {
-            ice_servers: vec![
-                RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    username: String::new(),
-                    credential: String::new(),
-                    ..Default::default()
-                },
-                RTCIceServer {
-                    urls: vec!["stun:stun1.l.google.com:19302".to_string()],
-                    username: String::new(),
-                    credential: String::new(),
-                    ..Default::default()
-                },
-            ],
-            ice_transport_policy: RTCIceTransportPolicy::All,
-            bundle_policy: RTCBundlePolicy::Balanced,
-            rtcp_mux_policy: RTCRtcpMuxPolicy::Require,
-            ..Default::default()
-        };
-
-        // Create peer connection
-        let peer_connection = Arc::new(api.new_peer_connection(config).await?);
-
-        // Set up connection state handler
-        let _pc_clone = Arc::clone(&peer_connection);
-        let session_id_clone = session_id.clone();
-        peer_connection.on_peer_connection_state_change(Box::new(move |s| {
-            let session_id = session_id_clone.clone();
-            Box::pin(async move {
-                info!(
-                    "WebRTC connection state for session {}: {:?}",
-                    session_id, s
-                );
-                if s == RTCPeerConnectionState::Failed {
-                    error!("WebRTC connection failed for session: {}", session_id);
-                }
-            })
-        }));
-
-        // Set up ICE connection state handler
-        let session_id_ice = session_id.clone();
-        peer_connection.on_ice_connection_state_change(Box::new(move |s| {
-            let session_id = session_id_ice.clone();
-            Box::pin(async move {
-                info!(
-                    "ICE connection state for session {}: {:?}",
-                    session_id, s
-                );
-            })
-        }));
-
-        // Set up data channel handler for incoming chunks
-        let storage_path_clone = storage_path.clone();
-        let used_space_clone = Arc::clone(&current_used_space_bytes);
-        let max_storage_clone = Arc::clone(&max_storage_bytes);
-        let chunk_count_clone = Arc::clone(&current_chunk_count);
-        let session_id_data = session_id.clone();
-
-        peer_connection.on_data_channel(Box::new(move |d| {
-            let storage_path = storage_path_clone.clone();
-            let used_space = Arc::clone(&used_space_clone);
-            let max_storage = Arc::clone(&max_storage_clone);
-            let chunk_count = Arc::clone(&chunk_count_clone);
-            let session_id = session_id_data.clone();
-
-            Box::pin(async move {
-                info!("Data channel opened for session: {}", session_id);
-
-                let d_clone = Arc::clone(&d);
-                d.on_message(Box::new(move |msg| {
-                    let storage_path = storage_path.clone();
-                    let used_space = Arc::clone(&used_space);
-                    let max_storage = Arc::clone(&max_storage);
-                    let chunk_count = Arc::clone(&chunk_count);
-                    let session_id = session_id.clone();
-                    let data_channel = Arc::clone(&d_clone);
-
-                    Box::pin(async move {
-                        if let Err(e) = handle_data_channel_message(
-                            msg,
-                            &storage_path,
-                            &used_space,
-                            &max_storage,
-                            &chunk_count,
-                            &session_id,
-                            &data_channel,
-                        )
-                        .await
-                        {
-                            error!(
-                                "Error handling data channel message for session {}: {}",
-                                session_id, e
-                            );
-                        }
-                    })
-                }));
-            })
-        }));
-
-        // Set up ICE candidate handler
-        let response_tx_ice = response_tx.clone();
-        let session_id_ice = session_id.clone();
-        peer_connection.on_ice_candidate(Box::new(move |c| {
-            let response_tx = response_tx_ice.clone();
-            let session_id = session_id_ice.clone();
-            Box::pin(async move {
-                if let Some(candidate) = c {
-                    let ice_message = serde_json::json!({
-                        "type": "P2P_RELAY",
-                        "sessionId": session_id,
-                        "payload": {
-                            "type": "ice-candidate",
-                            "candidate": candidate.to_json().unwrap_or_default()
-                        }
-                    });
-
-                    if let Err(e) = response_tx
-                        .send(Message::Text(ice_message.to_string()))
-                        .await
-                    {
-                        error!(
-                            "Failed to send ICE candidate for session {}: {}",
-                            session_id, e
-                        );
-                    } else {
-                        debug!("Sent ICE candidate for session {}", session_id);
-                    }
-                }
-            })
-        }));
-
-        // Store session
-        let session = WebRTCSession {
-            session_id: session_id.clone(),
-            user_id,
-            peer_connection: Arc::clone(&peer_connection),
-            file_metadata,
-            created_at: std::time::Instant::now(),
-            pending_chunk_id: Arc::new(Mutex::new(None)),
-            pending_chunk_buffer: Arc::new(Mutex::new(Vec::new())),
-            expected_chunk_size: Arc::new(Mutex::new(None)),
-            expected_total_parts: Arc::new(Mutex::new(None)),
-            received_parts: Arc::new(Mutex::new(0)),
-        };
-
-        {
-            let mut sessions = self.sessions.lock().await;
-            sessions.insert(session_id.clone(), session);
-        }
-
-        info!("WebRTC session created successfully: {}", session_id);
-        Ok(())
-    }
-
-    pub async fn get_session(&self, session_id: &str) -> Option<WebRTCSession> {
-        let sessions = self.sessions.lock().await;
-        sessions.get(session_id).cloned()
-    }
-
-    pub async fn remove_session(&self, session_id: &str) -> Option<WebRTCSession> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.remove(session_id) {
-            info!("Removed WebRTC session: {}", session_id);
-
-            // Close peer connection
-            if let Err(e) = session.peer_connection.close().await {
-                error!(
-                    "Error closing peer connection for session {}: {}",
-                    session_id, e
-                );
-            }
-
-            Some(session)
-        } else {
-            None
-        }
-    }
-
-    pub async fn process_offer(
-        &self,
-        session_id: &str,
-        offer_sdp: &str,
-        response_tx: &mpsc::Sender<Message>,
-    ) -> Result<()> {
-        let session = self
-            .get_session(session_id)
-            .await
-            .ok_or_else(|| anyhow!("Session not found: {}", session_id))?;
-
-        // Set remote description (offer)
-        let offer = RTCSessionDescription::offer(offer_sdp.to_string())?;
-        session
-            .peer_connection
-            .set_remote_description(offer)
-            .await?;
-
-        // Create answer
-        let answer = session.peer_connection.create_answer(None).await?;
-        session
-            .peer_connection
-            .set_local_description(answer.clone())
-            .await?;
-
-        // Send answer back via WebSocket signaling
-        let answer_message = serde_json::json!({
-            "type": "P2P_RELAY",
-            "sessionId": session_id,
-            "payload": {
-                "type": "answer",
-                "sdp": answer.sdp
-            }
+        let manager = Arc::new(Self {
+            peer_connection: pc.clone(),
+            storage_path,
+            storage_state,
+            active_uploads: Arc::new(Mutex::new(HashMap::new())),
+            current_upload_chunk_id: Arc::new(Mutex::new(None)),
         });
 
-        response_tx
-            .send(Message::Text(answer_message.to_string()))
-            .await?;
-        info!("Sent WebRTC answer for session: {}", session_id);
+        // Create a weak reference to self for use in the async callback.
+        let manager_weak: Weak<WebRTCManager> = Arc::downgrade(&manager);
 
-        Ok(())
-    }
-
-    pub async fn add_ice_candidate(
-        &self,
-        session_id: &str,
-        candidate_json: &serde_json::Value,
-    ) -> Result<()> {
-        let session = self
-            .get_session(session_id)
-            .await
-            .ok_or_else(|| anyhow!("Session not found: {}", session_id))?;
-
-        // Parse the ICE candidate JSON into RTCIceCandidateInit
-        if let Ok(candidate_str) = serde_json::to_string(candidate_json) {
-            if let Ok(candidate_init) = serde_json::from_str::<RTCIceCandidateInit>(&candidate_str)
-            {
-                session
-                    .peer_connection
-                    .add_ice_candidate(candidate_init)
-                    .await?;
-                debug!("Added ICE candidate for session: {}", session_id);
-            } else {
-                warn!("Failed to parse ICE candidate for session: {}", session_id);
-            }
-        } else {
-            warn!("Invalid ICE candidate JSON for session: {}", session_id);
-        }
-
-        Ok(())
-    }
-}
-
-// Handle incoming data channel messages
-async fn handle_data_channel_message(
-    msg: DataChannelMessage,
-    storage_path: &PathBuf,
-    current_used_space_bytes: &Arc<AtomicU64>,
-    max_storage_bytes: &Arc<AtomicU64>,
-    current_chunk_count: &Arc<AtomicU64>,
-    session_id: &str,
-    data_channel: &Arc<RTCDataChannel>,
-) -> Result<()> {
-    let data = msg.data.to_vec();
-
-    // Check if this is a text message or binary data
-    if let Ok(text) = String::from_utf8(data.clone()) {
-        // Try to parse as JSON chunk metadata
-        if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(chunk_id) = metadata.get("chunk_id").and_then(|v| v.as_str()) {
-                // This is chunk metadata - initialize multi-part reception
-                if let Some(session) = WEBRTC_MANAGER.get_session(session_id).await {
-                    let expected_size = metadata.get("size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    let total_parts = metadata.get("total_parts").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-                    
-                    // Initialize chunk reassembly state
-                    {
-                        let mut pending_id = session.pending_chunk_id.lock().await;
-                        *pending_id = Some(chunk_id.to_string());
-                    }
-                    {
-                        let mut buffer = session.pending_chunk_buffer.lock().await;
-                        buffer.clear();
-                        buffer.reserve(expected_size);
-                    }
-                    {
-                        let mut expected_chunk_size = session.expected_chunk_size.lock().await;
-                        *expected_chunk_size = Some(expected_size);
-                    }
-                    {
-                        let mut expected_total_parts = session.expected_total_parts.lock().await;
-                        *expected_total_parts = Some(total_parts);
-                    }
-                    {
-                        let mut received_parts = session.received_parts.lock().await;
-                        *received_parts = 0;
-                    }
-
-                    debug!(
-                        "Received chunk metadata via WebRTC: {} (size: {}, parts: {}) for session: {}",
-                        chunk_id, expected_size, total_parts, session_id
-                    );
-
-                    // Send acknowledgment
-                    if let Err(e) = data_channel.send_text("READY".to_string()).await {
-                        error!("Failed to send ready response: {}", e);
-                    }
-                    return Ok(());
+        // Define the handler for when the remote peer opens a data channel.
+        pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            let manager_arc = match manager_weak.upgrade() {
+                Some(arc) => arc,
+                None => {
+                    log::warn!("WebRTCManager instance dropped before data channel was established.");
+                    return Box::pin(async {});
                 }
-            }
-        }
-    }
-
-    // This is binary data - handle chunk part
-    if let Some(session) = WEBRTC_MANAGER.get_session(session_id).await {
-        let chunk_id = {
-            let pending = session.pending_chunk_id.lock().await;
-            if let Some(id) = pending.as_ref() {
-                id.clone()
-            } else {
-                error!(
-                    "Received binary data without pending chunk ID for session: {}",
-                    session_id
-                );
-                let response = "ERROR:No chunk ID provided for binary data";
-                if let Err(e) = data_channel.send_text(response.to_string()).await {
-                    error!("Failed to send error response: {}", e);
-                }
-                return Err(anyhow!("Binary data received without pending chunk ID"));
-            }
-        };
-
-        // Add this part to the buffer
-        {
-            let mut buffer = session.pending_chunk_buffer.lock().await;
-            buffer.extend_from_slice(&data);
-        }
-
-        // Increment received parts counter
-        let (current_parts, expected_parts, expected_size) = {
-            let mut received_parts = session.received_parts.lock().await;
-            *received_parts += 1;
-            let current = *received_parts;
-            
-            let expected_parts = session.expected_total_parts.lock().await;
-            let expected_size = session.expected_chunk_size.lock().await;
-            
-            (current, expected_parts.unwrap_or(1), expected_size.unwrap_or(0))
-        };
-
-        debug!(
-            "Received chunk part {}/{} for chunk {} ({} bytes) in session: {}",
-            current_parts, expected_parts, chunk_id, data.len(), session_id
-        );
-
-        // Check if we have all parts
-        if current_parts >= expected_parts {
-            // Get the complete chunk data
-            let complete_chunk_data = {
-                let buffer = session.pending_chunk_buffer.lock().await;
-                buffer.clone()
             };
 
-            // Validate expected size
-            if expected_size > 0 && complete_chunk_data.len() != expected_size {
-                let error_msg = format!(
-                    "Chunk size mismatch: expected {}, got {} bytes",
-                    expected_size, complete_chunk_data.len()
-                );
-                error!("{}", error_msg);
-                let response = format!("ERROR:{}", error_msg);
-                if let Err(e) = data_channel.send_text(response).await {
-                    error!("Failed to send error response: {}", e);
+            log::info!("New DataChannel '{}' with ID {}.", dc.label(), dc.id());
+
+            // Define the message handler for this specific data channel.
+            let dc_clone = dc.clone();
+            dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                // Clone the Arc to move it into the async block.
+                let manager_clone = manager_arc.clone();
+                let dc_clone2 = dc_clone.clone();
+                Box::pin(async move {
+                    if let Err(e) = manager_clone.handle_message(msg, dc_clone2).await {
+                        log::error!("Error handling data channel message: {}", e);
+                    }
+                })
+            }));
+
+            Box::pin(async {})
+        }));
+
+        Ok(manager)
+    }
+
+    // Handles an incoming SDP offer, creates an answer, and sets the local description.
+    pub async fn handle_offer_and_create_answer(
+        &self,
+        offer: RTCSessionDescription,
+    ) -> Result<RTCSessionDescription> {
+        self.peer_connection.set_remote_description(offer).await?;
+        let answer = self.peer_connection.create_answer(None).await?;
+        self.peer_connection.set_local_description(answer).await?;
+        self.peer_connection.local_description().await.ok_or_else(|| anyhow!("Local description not available after setting answer"))
+    }
+
+    // Deserializes and adds an ICE candidate received from the peer.
+    pub async fn add_ice_candidate(&self, candidate_json: String) -> Result<()> {
+        let candidate = serde_json::from_str::<webrtc::ice_transport::ice_candidate::RTCIceCandidateInit>(&candidate_json)?;
+        self.peer_connection.add_ice_candidate(candidate).await?;
+        Ok(())
+    }
+
+    // Main message handler, called from the `on_message` callback.
+    async fn handle_message(
+        &self,
+        msg: DataChannelMessage,
+        data_channel: Arc<RTCDataChannel>,
+    ) -> Result<()> {
+        if msg.is_string {
+            self.handle_control_message(
+                &msg.data,
+                data_channel,
+            ).await?;
+        } else {
+            self.handle_data_chunk(&msg.data).await?;
+        }
+        Ok(())
+    }
+
+    // Handles JSON control messages from the client.
+    async fn handle_control_message(
+        &self,
+        data: &[u8],
+        data_channel: Arc<RTCDataChannel>,
+    ) -> Result<()> {
+        let text = String::from_utf8_lossy(data);
+        match serde_json::from_str::<ClientMessage>(&text) {
+            Ok(message) => match message {
+                ClientMessage::Upload { chunk_id } => {
+                    log::info!("Received UPLOAD request for chunk_id: {}", chunk_id);
+                    let session = TransferSession { chunk_id: chunk_id.clone(), buffer: Vec::new() };
+                    self.active_uploads.lock().await.insert(chunk_id.clone(), session);
+                    *self.current_upload_chunk_id.lock().await = Some(chunk_id);
                 }
-                return Err(anyhow!(error_msg));
+                ClientMessage::Download { chunk_id } => {
+                    log::info!("Received DOWNLOAD request for chunk_id: {}", chunk_id);
+                    let manager = self.clone_for_task();
+                    tokio::spawn(async move {
+                        if let Err(e) = manager.handle_download_request(&chunk_id, data_channel).await {
+                            log::error!("Error during download for chunk {}: {}", chunk_id, e);
+                        }
+                    });
+                }
+                ClientMessage::DeleteChunk { chunk_id } => {
+                    log::info!("Received DELETE request for chunk_id: {}", chunk_id);
+                    let manager = self.clone_for_task();
+                    tokio::spawn(async move {
+                        if let Err(e) = manager.handle_delete_request(&chunk_id, data_channel).await {
+                            log::error!("Error during delete for chunk {}: {}", chunk_id, e);
+                        }
+                    });
+                }
+                ClientMessage::CheckChunk { chunk_id } => {
+                    log::info!("Received CHECK request for chunk_id: {}", chunk_id);
+                    let manager = self.clone_for_task();
+                    tokio::spawn(async move {
+                        if let Err(e) = manager.handle_check_request(&chunk_id, data_channel).await {
+                            log::error!("Error during check for chunk {}: {}", chunk_id, e);
+                        }
+                    });
+                }
+                ClientMessage::TransferComplete { chunk_id } => {
+                    log::info!("Received TRANSFER_COMPLETE for upload of chunk_id: {}", chunk_id);
+                    self.finalize_upload(&chunk_id, data_channel).await?;
+                    *self.current_upload_chunk_id.lock().await = None;
+                }
+                _ => log::warn!("Received unexpected client message type: {}", text),
+            },
+            Err(e) => log::warn!("Failed to parse control message: {}. Raw: '{}'", e, text),
+        };
+        Ok(())
+    }
+
+    // Handles incoming binary data for the currently active upload.
+    async fn handle_data_chunk(&self, data: &[u8]) -> Result<()> {
+        if let Some(chunk_id) = &*self.current_upload_chunk_id.lock().await {
+            let mut uploads = self.active_uploads.lock().await;
+            if let Some(session) = uploads.get_mut(chunk_id) {
+                session.buffer.extend_from_slice(data);
+            } else {
+                log::error!("Received data for non-existent session: {}", chunk_id);
             }
+        } else {
+            log::warn!("Received unexpected binary data with no active upload.");
+        }
+        Ok(())
+    }
 
-            debug!(
-                "Reassembled complete chunk via WebRTC: {} ({} bytes) for session: {}",
-                chunk_id,
-                complete_chunk_data.len(),
-                session_id
-            );
-
-            // Store the complete chunk
-            match storage::store_chunk_data_to_disk(
-                storage_path,
-                &chunk_id,
-                &complete_chunk_data,
-                current_used_space_bytes,
-                max_storage_bytes,
-                current_chunk_count,
-            )
-            .await
-            {
-                Ok(chunk_size) => {
-                    info!(
-                        "Successfully stored reassembled chunk {} ({} bytes) via WebRTC",
-                        chunk_id, chunk_size
-                    );
-
-                    // Clean up session state
-                    {
-                        let mut pending_id = session.pending_chunk_id.lock().await;
-                        *pending_id = None;
-                    }
-                    {
-                        let mut buffer = session.pending_chunk_buffer.lock().await;
-                        buffer.clear();
-                    }
-                    {
-                        let mut expected_chunk_size = session.expected_chunk_size.lock().await;
-                        *expected_chunk_size = None;
-                    }
-                    {
-                        let mut expected_total_parts = session.expected_total_parts.lock().await;
-                        *expected_total_parts = None;
-                    }
-                    {
-                        let mut received_parts = session.received_parts.lock().await;
-                        *received_parts = 0;
-                    }
-
-                    // Send simple text response with chunk ID
-                    let response = format!("STORED:{}", chunk_id);
-                    if let Err(e) = data_channel.send_text(response).await {
-                        error!(
-                            "Failed to send success response for chunk {}: {}",
-                            chunk_id, e
-                        );
-                    }
+    async fn finalize_upload(&self, chunk_id: &str, data_channel: Arc<RTCDataChannel>) -> Result<()> {
+        let mut uploads = self.active_uploads.lock().await;
+        if let Some(session) = uploads.remove(chunk_id) {
+            log::info!("Finalizing upload for chunk {}. Total size: {} bytes", chunk_id, session.buffer.len());
+            match storage::store_chunk_data_to_disk(&self.storage_path, &session.chunk_id, &session.buffer, self.storage_state.clone()).await {
+                Ok(_) => {
+                    let msg = ClientMessage::TransferComplete { chunk_id: chunk_id.to_string() };
+                    data_channel.send_text(serde_json::to_string(&msg)?).await?;
                 }
                 Err(e) => {
-                    error!("Failed to store chunk {} via WebRTC: {}", chunk_id, e);
-
-                    // Clean up session state on error
-                    {
-                        let mut pending_id = session.pending_chunk_id.lock().await;
-                        *pending_id = None;
-                    }
-                    {
-                        let mut buffer = session.pending_chunk_buffer.lock().await;
-                        buffer.clear();
-                    }
-                    {
-                        let mut expected_chunk_size = session.expected_chunk_size.lock().await;
-                        *expected_chunk_size = None;
-                    }
-                    {
-                        let mut expected_total_parts = session.expected_total_parts.lock().await;
-                        *expected_total_parts = None;
-                    }
-                    {
-                        let mut received_parts = session.received_parts.lock().await;
-                        *received_parts = 0;
-                    }
-
-                    // Send simple error response
-                    let response = format!("ERROR:{}", e);
-                    if let Err(send_err) = data_channel.send_text(response).await {
-                        error!(
-                            "Failed to send error response for chunk {}: {}",
-                            chunk_id, send_err
-                        );
-                    }
-
+                    self.send_error(chunk_id, &e.to_string(), &data_channel).await?;
                     return Err(e);
                 }
             }
+        } else {
+            let err_msg = format!("Cannot finalize: No upload session for chunk_id: {}", chunk_id);
+            self.send_error(chunk_id, &err_msg, &data_channel).await?;
+            return Err(anyhow!(err_msg));
         }
-        // If not all parts received yet, just continue waiting
-        
-    } else {
-        // No session - error out
-        error!("Received binary data for unknown session: {}", session_id);
-        let response = "ERROR:Unknown session";
-        if let Err(e) = data_channel.send_text(response.to_string()).await {
-            error!("Failed to send error response: {}", e);
-        }
-        return Err(anyhow!("Binary data received for unknown session"));
+        Ok(())
     }
 
-    Ok(())
-}
+    async fn handle_download_request(&self, chunk_id: &str, data_channel: Arc<RTCDataChannel>) -> Result<()> {
+        match storage::retrieve_chunk_data_from_disk(&self.storage_path, chunk_id).await {
+            Ok(data) => {
+                for chunk in data.chunks(16 * 1024) {
+                    wait_for_data_channel_buffer(&data_channel).await;
+                    data_channel.send(&Bytes::copy_from_slice(chunk)).await?;
+                }
+                let msg = ClientMessage::TransferComplete { chunk_id: chunk_id.to_string() };
+                data_channel.send_text(serde_json::to_string(&msg)?).await?;
+            }
+            Err(e) => self.send_error(chunk_id, &e.to_string(), &data_channel).await?,
+        }
+        Ok(())
+    }
 
-// Public API functions for use in commands.rs
-pub async fn create_webrtc_session(
-    session_id: String,
-    user_id: String,
-    file_metadata: serde_json::Value,
-    storage_path: PathBuf,
-    current_used_space_bytes: Arc<AtomicU64>,
-    max_storage_bytes: Arc<AtomicU64>,
-    current_chunk_count: Arc<AtomicU64>,
-    response_tx: mpsc::Sender<Message>,
-) -> Result<()> {
-    WEBRTC_MANAGER
-        .create_session(
-            session_id,
-            user_id,
-            file_metadata,
-            storage_path,
-            current_used_space_bytes,
-            max_storage_bytes,
-            current_chunk_count,
-            response_tx,
-        )
-        .await
-}
+    async fn handle_delete_request(&self, chunk_id: &str, data_channel: Arc<RTCDataChannel>) -> Result<()> {
+        match storage::delete_chunk_from_disk(&self.storage_path, chunk_id, self.storage_state.clone()).await {
+            Ok(_) => {
+                let msg = ClientMessage::TransferComplete { chunk_id: chunk_id.to_string() };
+                data_channel.send_text(serde_json::to_string(&msg)?).await?;
+            }
+            Err(e) => self.send_error(chunk_id, &e.to_string(), &data_channel).await?,
+        }
+        Ok(())
+    }
 
-pub async fn process_webrtc_offer(
-    session_id: &str,
-    offer_sdp: &str,
-    response_tx: &mpsc::Sender<Message>,
-) -> Result<()> {
-    WEBRTC_MANAGER
-        .process_offer(session_id, offer_sdp, response_tx)
-        .await
-}
+    async fn handle_check_request(&self, chunk_id: &str, data_channel: Arc<RTCDataChannel>) -> Result<()> {
+        match storage::check_chunk_exists(&self.storage_path, chunk_id).await {
+            Ok(exists) => {
+                let msg = ClientMessage::ChunkStatus { chunk_id: chunk_id.to_string(), exists };
+                data_channel.send_text(serde_json::to_string(&msg)?).await?;
+            }
+            Err(e) => self.send_error(chunk_id, &e.to_string(), &data_channel).await?,
+        }
+        Ok(())
+    }
+    
+    // Creates a clone of the necessary state for spawning a new async task.
+    fn clone_for_task(&self) -> Self {
+        Self {
+            peer_connection: self.peer_connection.clone(),
+            storage_path: self.storage_path.clone(),
+            storage_state: self.storage_state.clone(),
+            active_uploads: self.active_uploads.clone(),
+            current_upload_chunk_id: self.current_upload_chunk_id.clone(),
+        }
+    }
 
-pub async fn add_webrtc_ice_candidate(
-    session_id: &str,
-    candidate_json: &serde_json::Value,
-) -> Result<()> {
-    WEBRTC_MANAGER
-        .add_ice_candidate(session_id, candidate_json)
-        .await
-}
-
-pub async fn close_webrtc_session(session_id: &str) -> Option<WebRTCSession> {
-    WEBRTC_MANAGER.remove_session(session_id).await
+    // Sends a formatted error message to the client.
+    async fn send_error(&self, chunk_id: &str, error: &str, dc: &Arc<RTCDataChannel>) -> Result<()> {
+        log::error!("Error for chunk {}: {}", chunk_id, error);
+        let err_msg = ClientMessage::TransferError { chunk_id: chunk_id.to_string(), error: error.to_string() };
+        dc.send_text(serde_json::to_string(&err_msg)?).await?;
+        Ok(())
+    }
 }
