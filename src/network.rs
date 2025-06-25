@@ -56,7 +56,11 @@ impl Network {
         let max_delay_ms = 60000;
 
         loop {
-            info!("Attempting to connect to WebSocket: {}. Attempt #{}", self.ws_url, attempts + 1);
+            info!(
+                "Attempting to connect to WebSocket: {}. Attempt #{}",
+                self.ws_url,
+                attempts + 1
+            );
 
             match self
                 .establish_and_process_messages(&mut outgoing_responses_rx)
@@ -107,7 +111,10 @@ impl Network {
         };
         debug!("WebSocket handshake response: {:?}", response);
 
-        info!("Successfully connected to backend WebSocket: {}", self.ws_url);
+        info!(
+            "Successfully connected to backend WebSocket: {}",
+            self.ws_url
+        );
 
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
@@ -131,12 +138,15 @@ impl Network {
         .await
         {
             Ok(Some(Ok(Message::Text(text)))) => {
-                let response_val: serde_json::Value = serde_json::from_str(&text)
-                    .context("Failed to parse auth response as JSON")?;
+                let response_val: serde_json::Value =
+                    serde_json::from_str(&text).context("Failed to parse auth response as JSON")?;
                 match response_val.get("type").and_then(|v| v.as_str()) {
                     Some("AUTH_SUCCESS") => info!("Authentication successful."),
                     Some("AUTH_FAILED") => {
-                        let reason = response_val.get("reason").and_then(|v| v.as_str()).unwrap_or("Unknown reason");
+                        let reason = response_val
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Unknown reason");
                         return Err(anyhow!("Authentication failed: {}", reason));
                     }
                     _ => return Err(anyhow!("Unexpected auth response: {}", text)),
@@ -206,7 +216,12 @@ impl Network {
                     "Failed to parse incoming message as BackendCommand: {}. Message: '{}'",
                     e, message_text
                 );
-                if self.command_sender.send(BackendCommand::Unknown).await.is_err() {
+                if self
+                    .command_sender
+                    .send(BackendCommand::Unknown)
+                    .await
+                    .is_err()
+                {
                     error!("Cannot send Unknown command, channel closed");
                 }
             }

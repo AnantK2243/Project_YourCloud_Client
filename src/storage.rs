@@ -145,7 +145,9 @@ pub async fn store_chunk_data_to_disk(
 
     // Check user set storage limit with overflow protection
     let current_max = storage_state.max_storage_bytes.load(Ordering::Acquire);
-    let current_used = storage_state.current_used_space_bytes.load(Ordering::Acquire);
+    let current_used = storage_state
+        .current_used_space_bytes
+        .load(Ordering::Acquire);
 
     if current_used.saturating_add(chunk_size) > current_max {
         return Err(anyhow!(
@@ -194,8 +196,12 @@ pub async fn store_chunk_data_to_disk(
             match fs::rename(&temp_path, &chunk_path).await {
                 Ok(_) => {
                     // Update counters only after successful write
-                    storage_state.current_used_space_bytes.fetch_add(chunk_size, Ordering::Acquire);
-                    storage_state.current_chunk_count.fetch_add(1, Ordering::Acquire);
+                    storage_state
+                        .current_used_space_bytes
+                        .fetch_add(chunk_size, Ordering::Acquire);
+                    storage_state
+                        .current_chunk_count
+                        .fetch_add(1, Ordering::Acquire);
                     Ok(chunk_size)
                 }
                 Err(e) => {
@@ -252,8 +258,12 @@ pub async fn delete_chunk_from_disk(
                 .await
                 .with_context(|| format!("Failed to delete chunk file: {:?}", chunk_path))?;
 
-            storage_state.current_used_space_bytes.fetch_sub(size, Ordering::Release);
-            storage_state.current_chunk_count.fetch_sub(1, Ordering::Release);
+            storage_state
+                .current_used_space_bytes
+                .fetch_sub(size, Ordering::Release);
+            storage_state
+                .current_chunk_count
+                .fetch_sub(1, Ordering::Release);
 
             Ok(Some(size))
         }

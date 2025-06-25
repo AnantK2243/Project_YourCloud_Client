@@ -13,7 +13,6 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
-
 pub type WebRTCConnections = Arc<Mutex<HashMap<String, Arc<WebRTCManager>>>>;
 
 /// Defines the commands that the Rust client can receive from the backend proxy server.
@@ -45,7 +44,10 @@ pub async fn handle_command(
     match command {
         BackendCommand::WebRtcOffer { command_id, offer } => {
             if webrtc_connections.lock().await.contains_key(&command_id) {
-                warn!("Duplicate WebRTC offer for session: {}. Ignoring.", command_id);
+                warn!(
+                    "Duplicate WebRTC offer for session: {}. Ignoring.",
+                    command_id
+                );
                 return Ok(());
             }
 
@@ -53,7 +55,10 @@ pub async fn handle_command(
             let manager = WebRTCManager::new(storage_path, storage_state).await?;
 
             // Insert the new manager Arc into our shared state map.
-            webrtc_connections.lock().await.insert(command_id.clone(), manager.clone());
+            webrtc_connections
+                .lock()
+                .await
+                .insert(command_id.clone(), manager.clone());
 
             let offer_sdp: RTCSessionDescription = serde_json::from_value(offer)
                 .map_err(|e| anyhow!("Failed to deserialize offer SDP: {}", e))?;
@@ -65,20 +70,31 @@ pub async fn handle_command(
                         "type": "WEB_RTC_ANSWER",
                         "answer": answer,
                     });
-                    response_tx.send(Message::Text(answer_payload.to_string())).await?;
+                    response_tx
+                        .send(Message::Text(answer_payload.to_string()))
+                        .await?;
                 }
                 Err(e) => {
-                    error!("Failed to handle WebRTC offer for session {}: {}", command_id, e);
+                    error!(
+                        "Failed to handle WebRTC offer for session {}: {}",
+                        command_id, e
+                    );
                     webrtc_connections.lock().await.remove(&command_id); // Cleanup on failure
                     return Err(e);
                 }
             }
         }
 
-        BackendCommand::WebRtcIceCandidate { command_id, candidate } => {
+        BackendCommand::WebRtcIceCandidate {
+            command_id,
+            candidate,
+        } => {
             if let Some(manager) = webrtc_connections.lock().await.get(&command_id) {
                 if let Err(e) = manager.add_ice_candidate(candidate).await {
-                    error!("Failed to add ICE candidate for session {}: {}", command_id, e);
+                    error!(
+                        "Failed to add ICE candidate for session {}: {}",
+                        command_id, e
+                    );
                 }
 
                 // Reply with acknowledgment
@@ -88,7 +104,9 @@ pub async fn handle_command(
                     "status": "received",
                 });
 
-                response_tx.send(Message::Text(ack_payload.to_string())).await?;
+                response_tx
+                    .send(Message::Text(ack_payload.to_string()))
+                    .await?;
             } else {
                 warn!("Received ICE candidate for unknown session: {}", command_id);
             }

@@ -2,9 +2,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use log::{error, info};
+use std::sync::Arc;
 use tokio::fs;
 use tokio::signal;
-use std::sync::Arc;
 
 // Backend WebSocket URL configuration
 // const WS_URL: &str = "wss://wss.project-yourcloud.me";
@@ -74,18 +74,21 @@ async fn main() -> Result<()> {
         .context("Failed to initialize storage state")?;
     info!(
         "Storage state initialized. Max: {} bytes, Current Used: {} bytes, Chunks: {}.",
-        storage_state.max_storage_bytes.load(std::sync::atomic::Ordering::Relaxed),
-        storage_state.current_used_space_bytes.load(std::sync::atomic::Ordering::Relaxed),
-        storage_state.current_chunk_count.load(std::sync::atomic::Ordering::Relaxed)
+        storage_state
+            .max_storage_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        storage_state
+            .current_used_space_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        storage_state
+            .current_chunk_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     );
 
     // Start the communication loop (includes registration if needed)
     info!("Starting communication loop...");
-    let comm_loop = start_communication_loop(
-        config.clone(),
-        WS_URL.to_string(),
-        Arc::new(storage_state),
-    );
+    let comm_loop =
+        start_communication_loop(config.clone(), WS_URL.to_string(), Arc::new(storage_state));
 
     // Handle shutdown signal
     tokio::select! {
