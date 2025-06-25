@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use log::{error, info};
 use tokio::fs;
 use tokio::signal;
+use std::sync::Arc;
 
 // Backend WebSocket URL configuration
 // const WS_URL: &str = "wss://wss.project-yourcloud.me";
@@ -14,6 +15,7 @@ mod commands;
 mod config;
 mod network;
 mod storage;
+mod webrtc;
 
 use crate::config::load_config;
 use crate::network::start_communication_loop;
@@ -66,16 +68,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize storage state (scans existing files)
-    let (used_space_bytes, max_storage_bytes, chunk_count) =
-        initialize_storage_state(&config.storage_path, config.max_storage_gib)
-            .await
-            .context("Failed to initialize storage state")?;
+    // Initialize storage state
+    let storage_state = initialize_storage_state(&config.storage_path, config.max_storage_gib)
+        .await
+        .context("Failed to initialize storage state")?;
     info!(
         "Storage state initialized. Max: {} bytes, Current Used: {} bytes, Chunks: {}.",
-        max_storage_bytes.load(std::sync::atomic::Ordering::Relaxed),
-        used_space_bytes.load(std::sync::atomic::Ordering::Relaxed),
-        chunk_count.load(std::sync::atomic::Ordering::Relaxed)
+        storage_state.max_storage_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        storage_state.current_used_space_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        storage_state.current_chunk_count.load(std::sync::atomic::Ordering::Relaxed)
     );
 
     // Start the communication loop (includes registration if needed)
@@ -83,9 +84,7 @@ async fn main() -> Result<()> {
     let comm_loop = start_communication_loop(
         config.clone(),
         WS_URL.to_string(),
-        used_space_bytes,
-        max_storage_bytes,
-        chunk_count,
+        Arc::new(storage_state),
     );
 
     // Handle shutdown signal

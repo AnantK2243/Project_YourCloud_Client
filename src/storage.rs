@@ -8,6 +8,13 @@ use std::sync::Arc;
 use sysinfo::Disks;
 use tokio::fs;
 
+#[derive(Debug, Clone)]
+pub struct StorageState {
+    pub current_used_space_bytes: Arc<AtomicU64>,
+    pub max_storage_bytes: Arc<AtomicU64>,
+    pub current_chunk_count: Arc<AtomicU64>,
+}
+
 pub fn get_disk_available_space(storage_path: &Path) -> Result<u64> {
     // Converts the given storage path to its absolute canonical path.
     let canonical_storage_path = storage_path.canonicalize().with_context(|| {
@@ -54,7 +61,7 @@ pub fn get_disk_available_space(storage_path: &Path) -> Result<u64> {
 pub async fn initialize_storage_state(
     storage_path_base: &Path,
     max_storage_gib: f64,
-) -> Result<(Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>)> {
+) -> Result<StorageState> {
     let current_used_space = Arc::new(AtomicU64::new(0));
     let current_chunk_count = Arc::new(AtomicU64::new(0));
     let max_bytes = Arc::new(AtomicU64::new(
@@ -102,16 +109,20 @@ pub async fn initialize_storage_state(
     current_used_space.store(total_size, Ordering::Release);
     current_chunk_count.store(total_count, Ordering::Release);
 
-    Ok((current_used_space, max_bytes, current_chunk_count))
+    let storage_state = StorageState {
+        current_used_space_bytes: current_used_space,
+        max_storage_bytes: max_bytes,
+        current_chunk_count,
+    };
+
+    Ok(storage_state)
 }
 
 pub async fn store_chunk_data_to_disk(
     storage_path_base: &Path,
     chunk_id: &str,
     chunk_data: &[u8],
-    current_used_space_bytes: &Arc<AtomicU64>,
-    max_storage_bytes: &Arc<AtomicU64>,
-    current_chunk_count: &Arc<AtomicU64>,
+    storage_state: Arc<StorageState>,
 ) -> Result<u64> {
     // Validate chunk_id for security
     if chunk_id.is_empty() || chunk_id.len() > 255 {
@@ -133,8 +144,8 @@ pub async fn store_chunk_data_to_disk(
     }
 
     // Check user set storage limit with overflow protection
-    let current_max = max_storage_bytes.load(Ordering::Acquire);
-    let current_used = current_used_space_bytes.load(Ordering::Acquire);
+    let current_max = storage_state.max_storage_bytes.load(Ordering::Acquire);
+    let current_used = storage_state.current_used_space_bytes.load(Ordering::Acquire);
 
     if current_used.saturating_add(chunk_size) > current_max {
         return Err(anyhow!(
@@ -183,8 +194,8 @@ pub async fn store_chunk_data_to_disk(
             match fs::rename(&temp_path, &chunk_path).await {
                 Ok(_) => {
                     // Update counters only after successful write
-                    current_used_space_bytes.fetch_add(chunk_size, Ordering::Acquire);
-                    current_chunk_count.fetch_add(1, Ordering::Acquire);
+                    storage_state.current_used_space_bytes.fetch_add(chunk_size, Ordering::Acquire);
+                    storage_state.current_chunk_count.fetch_add(1, Ordering::Acquire);
                     Ok(chunk_size)
                 }
                 Err(e) => {
@@ -229,8 +240,7 @@ pub async fn retrieve_chunk_data_from_disk(
 pub async fn delete_chunk_from_disk(
     storage_path_base: &Path,
     chunk_id: &str,
-    current_used_space_bytes: &Arc<AtomicU64>,
-    current_chunk_count: &Arc<AtomicU64>,
+    storage_state: Arc<StorageState>,
 ) -> Result<Option<u64>> {
     let chunk_path = storage_path_base.join(chunk_id);
 
@@ -242,8 +252,8 @@ pub async fn delete_chunk_from_disk(
                 .await
                 .with_context(|| format!("Failed to delete chunk file: {:?}", chunk_path))?;
 
-            current_used_space_bytes.fetch_sub(size, Ordering::Release);
-            current_chunk_count.fetch_sub(1, Ordering::Release);
+            storage_state.current_used_space_bytes.fetch_sub(size, Ordering::Release);
+            storage_state.current_chunk_count.fetch_sub(1, Ordering::Release);
 
             Ok(Some(size))
         }

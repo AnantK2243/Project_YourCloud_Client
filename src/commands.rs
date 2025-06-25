@@ -1,271 +1,107 @@
 // src/commands.rs
 
 use crate::network;
-use crate::storage;
+use crate::storage::StorageState;
+use crate::webrtc::WebRTCManager;
 use anyhow::{anyhow, Result};
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::protocol::Message;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct NodeStatus {
-    pub used_space_bytes: u64,
-    pub max_space_bytes: u64,
-    pub current_chunk_count: u64,
-}
 
+pub type WebRTCConnections = Arc<Mutex<HashMap<String, Arc<WebRTCManager>>>>;
+
+/// Defines the commands that the Rust client can receive from the backend proxy server.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "command_type", rename_all = "SCREAMING_SNAKE_CASE")] // Use tag for easy parsing
+#[serde(tag = "command_type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BackendCommand {
-    StoreChunk {
+    WebRtcOffer {
         command_id: String,
-        chunk_id: String,
-        data_size: u64,
-        binary_data: Option<Vec<u8>>,
+        offer: serde_json::Value,
     },
-    GetChunk {
+    WebRtcIceCandidate {
         command_id: String,
-        chunk_id: String,
-    },
-    DeleteChunk {
-        command_id: String,
-        chunk_id: String,
-    },
-    CheckChunk {
-        command_id: String,
-        chunk_id: String,
+        candidate: String,
     },
     StatusRequest {
         command_id: String,
     },
-    #[serde(other)] // Error Out Unrecognized commands
+    #[serde(other)]
     Unknown,
 }
 
 pub async fn handle_command(
     command: BackendCommand,
-    storage_path: std::path::PathBuf,
     response_tx: mpsc::Sender<Message>,
-    current_used_space_bytes: Arc<AtomicU64>,
-    max_storage_bytes: Arc<AtomicU64>,
-    current_chunk_count: Arc<AtomicU64>,
+    storage_state: Arc<StorageState>,
+    webrtc_connections: WebRTCConnections,
+    storage_path: PathBuf,
 ) -> Result<()> {
     match command {
-        // Store chunk data
-        BackendCommand::StoreChunk {
-            command_id,
-            chunk_id,
-            data_size,
-            binary_data,
-        } => {
-            let result = match binary_data {
-                Some(chunk_data) => {
-                    // Verify data size matches expected
-                    if chunk_data.len() != data_size as usize {
-                        Err(anyhow!(
-                            "Binary data size mismatch: expected {}, got {}",
-                            data_size,
-                            chunk_data.len()
-                        ))
-                    } else {
-                        match storage::store_chunk_data_to_disk(
-                            &storage_path,
-                            &chunk_id,
-                            &chunk_data,
-                            &current_used_space_bytes,
-                            &max_storage_bytes,
-                            &current_chunk_count,
-                        )
-                        .await
-                        {
-                            Ok(chunk_size) => {
-                                // Send positive storage delta for stored chunk
-                                send_result(
-                                    &response_tx,
-                                    command_id,
-                                    Ok(()),
-                                    Some(chunk_size as i64),
-                                )
-                                .await?;
-                                return Ok(());
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                }
-                None => Err(anyhow!("No binary data provided for STORE_CHUNK command")),
-            };
-
-            send_result(&response_tx, command_id, result, None).await?;
-        }
-
-        // Get chunk and return binary data
-        BackendCommand::GetChunk {
-            command_id,
-            chunk_id,
-        } => {
-            // Validate chunk_id
-            if chunk_id.is_empty() || chunk_id.len() > 255 {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: empty or too long")),
-                    None,
-                )
-                .await?;
+        BackendCommand::WebRtcOffer { command_id, offer } => {
+            if webrtc_connections.lock().await.contains_key(&command_id) {
+                warn!("Duplicate WebRTC offer for session: {}. Ignoring.", command_id);
                 return Ok(());
             }
 
-            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
+            // Create a new WebRTCManager, passing the necessary state.
+            let manager = WebRTCManager::new(storage_path, storage_state).await?;
 
-            let result = storage::retrieve_chunk_data_from_disk(&storage_path, &chunk_id).await;
+            // Insert the new manager Arc into our shared state map.
+            webrtc_connections.lock().await.insert(command_id.clone(), manager.clone());
 
-            match result {
-                Ok(chunk_data) => {
-                    network::send_chunk_data(&response_tx, command_id, chunk_data).await?;
+            let offer_sdp: RTCSessionDescription = serde_json::from_value(offer)
+                .map_err(|e| anyhow!("Failed to deserialize offer SDP: {}", e))?;
+
+            match manager.handle_offer_and_create_answer(offer_sdp).await {
+                Ok(answer) => {
+                    let answer_payload = serde_json::json!({
+                        "command_id": command_id,
+                        "type": "WEB_RTC_ANSWER",
+                        "answer": answer,
+                    });
+                    response_tx.send(Message::Text(answer_payload.to_string())).await?;
                 }
                 Err(e) => {
-                    send_result(&response_tx, command_id, Err(e), None).await?;
+                    error!("Failed to handle WebRTC offer for session {}: {}", command_id, e);
+                    webrtc_connections.lock().await.remove(&command_id); // Cleanup on failure
+                    return Err(e);
                 }
             }
         }
 
-        // Remove file from store
-        BackendCommand::DeleteChunk {
-            command_id,
-            chunk_id,
-        } => {
-            // Validate chunk_id
-            if chunk_id.is_empty() || chunk_id.len() > 255 {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: empty or too long")),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
+        BackendCommand::WebRtcIceCandidate { command_id, candidate } => {
+            if let Some(manager) = webrtc_connections.lock().await.get(&command_id) {
+                if let Err(e) = manager.add_ice_candidate(candidate).await {
+                    error!("Failed to add ICE candidate for session {}: {}", command_id, e);
+                }
 
-            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
+                // Reply with acknowledgment
+                let ack_payload = serde_json::json!({
+                    "command_id": command_id,
+                    "type": "ICE_CANDIDATE_ACK",
+                    "status": "received",
+                });
 
-            match storage::delete_chunk_from_disk(
-                &storage_path,
-                &chunk_id,
-                &current_used_space_bytes,
-                &current_chunk_count,
-            )
-            .await
-            {
-                Ok(Some(deleted_size)) => {
-                    // Send negative storage delta for deleted chunk
-                    send_result(
-                        &response_tx,
-                        command_id,
-                        Ok(()),
-                        Some(-(deleted_size as i64)),
-                    )
-                    .await?;
-                }
-                Ok(None) => {
-                    // Chunk didn't exist, no storage change
-                    send_result(&response_tx, command_id, Ok(()), None).await?;
-                }
-                Err(e) => {
-                    send_result(&response_tx, command_id, Err(e), None).await?;
-                }
+                response_tx.send(Message::Text(ack_payload.to_string())).await?;
+            } else {
+                warn!("Received ICE candidate for unknown session: {}", command_id);
             }
         }
 
-        // Check if chunk exists
-        BackendCommand::CheckChunk {
-            command_id,
-            chunk_id,
-        } => {
-            // Validate chunk_id
-            if chunk_id.is_empty() || chunk_id.len() > 255 {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: empty or too long")),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-
-            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-
-            let exists = storage::check_chunk_exists(&storage_path, &chunk_id).await;
-            match exists {
-                Ok(found) => {
-                    network::send_check_response(&response_tx, command_id, found).await?;
-                }
-                Err(e) => {
-                    send_result(&response_tx, command_id, Err(e), None).await?;
-                }
-            }
-        }
-
-        // Handle status request from server
         BackendCommand::StatusRequest { command_id } => {
-            let status = NodeStatus {
-                used_space_bytes: current_used_space_bytes.load(Ordering::Relaxed),
-                max_space_bytes: max_storage_bytes.load(Ordering::Relaxed),
-                current_chunk_count: current_chunk_count.load(Ordering::Relaxed),
-            };
-
-            network::send_status_report(&response_tx, command_id, status).await?;
+            network::send_status_report(&response_tx, command_id, storage_state).await?;
         }
 
-        // Unknown command
         BackendCommand::Unknown => {
             warn!("Received unknown or unparsable command - ignoring.");
         }
     }
 
     Ok(())
-}
-
-async fn send_result(
-    response_tx: &mpsc::Sender<Message>,
-    command_id: String,
-    result: Result<()>,
-    storage_delta: Option<i64>,
-) -> Result<()> {
-    if let Err(e) = &result {
-        error!("Operation for command {} failed: {}", command_id, e);
-    }
-    network::send_command_result(response_tx, command_id, result, storage_delta).await
 }
