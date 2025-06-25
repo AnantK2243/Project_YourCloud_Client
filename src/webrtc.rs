@@ -6,55 +6,52 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::tungstenite::protocol::Message;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::storage::{self, StorageState};
 
-// Represents a temporary session for a chunk upload.
+/// Represents a temporary session for a chunk upload.
 #[derive(Debug, Clone)]
 pub struct TransferSession {
     pub chunk_id: String,
     pub buffer: Vec<u8>,
 }
 
-// Defines the message protocol used over the WebRTC data channel.
+/// Defines the message protocol used over the WebRTC data channel.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ClientMessage {
-    // Messages received from client
     Upload { chunk_id: String },
     Download { chunk_id: String },
-    DeleteChunk { chunk_id: String },
-    CheckChunk { chunk_id: String },
-
-    // Can be received (on upload) or sent
+    Delete { chunk_id: String },
+    CheckId { chunk_id: String },
     TransferComplete { chunk_id: String },
-
-    // Messages sent to client
     TransferError { chunk_id: String, error: String },
-    ChunkStatus { chunk_id: String, exists: bool },
+    IdStatus { chunk_id: String, exists: bool },
 }
 
-// Manages a single WebRTC peer connection, its state, and data transfers.
+/// Manages a single WebRTC peer connection, its state, and data transfers.
 pub struct WebRTCManager {
     pub peer_connection: Arc<RTCPeerConnection>,
-    // State needed for handling file operations, captured at creation time.
     storage_path: PathBuf,
     storage_state: Arc<StorageState>,
-    // State for managing concurrent uploads.
     active_uploads: Arc<Mutex<HashMap<String, TransferSession>>>,
     current_upload_chunk_id: Arc<Mutex<Option<String>>>,
 }
 
 async fn wait_for_data_channel_buffer(data_channel: &Arc<RTCDataChannel>) {
-    const HIGH_WATER_MARK: usize = 16 * 1024 * 1024; // 16MB
+    const HIGH_WATER_MARK: usize = 16 * 1024 * 1024;
     while data_channel.buffered_amount().await > HIGH_WATER_MARK {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut tx = Some(tx);
@@ -71,13 +68,32 @@ async fn wait_for_data_channel_buffer(data_channel: &Arc<RTCDataChannel>) {
 }
 
 impl WebRTCManager {
-    pub async fn new(storage_path: PathBuf, storage_state: Arc<StorageState>) -> Result<Arc<Self>> {
-        let pc = Arc::new(
-            APIBuilder::new()
-                .build()
-                .new_peer_connection(RTCConfiguration::default())
-                .await?,
-        );
+    /// Creates a new `WebRTCManager` and sets up all necessary WebRTC event handlers.
+    pub async fn new(
+        storage_path: PathBuf,
+        storage_state: Arc<StorageState>,
+        response_tx: mpsc::Sender<Message>,
+        session_id: String,
+    ) -> Result<Arc<Self>> {
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.set_network_types(vec![webrtc::ice::network_type::NetworkType::Udp4]);
+
+        let api = APIBuilder::new().with_setting_engine(setting_engine).build();
+
+        let config = RTCConfiguration {
+            ice_servers: vec![
+                RTCIceServer {
+                    urls: vec![
+                        "stun:stun.l.google.com:19302".to_owned(),
+                        "stun:global.stun.twilio.com:3478".to_owned(),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        
+        let pc = Arc::new(api.new_peer_connection(config).await?);
 
         let manager = Arc::new(Self {
             peer_connection: pc.clone(),
@@ -87,43 +103,59 @@ impl WebRTCManager {
             current_upload_chunk_id: Arc::new(Mutex::new(None)),
         });
 
-        // Create a weak reference to self for use in the async callback.
+        pc.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+            let response_tx = response_tx.clone();
+            let session_id = session_id.clone();
+            Box::pin(async move {
+                if let Some(candidate) = candidate {
+                    match candidate.to_json() {
+                        Ok(candidate_json) => {
+                            let payload = serde_json::json!({
+                                "command_id": session_id,
+                                "type": "ICE_CANDIDATE_ANSWER",
+                                "candidate": candidate_json,
+                            });
+                            let msg = Message::Text(payload.to_string());
+                            if response_tx.send(msg).await.is_err() {
+                                log::error!("Failed to send ICE candidate: response channel closed.");
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to serialize ICE candidate to JSON: {}", e);
+                        }
+                    }
+                }
+            })
+        }));
+
         let manager_weak: Weak<WebRTCManager> = Arc::downgrade(&manager);
 
-        // Define the handler for when the remote peer opens a data channel.
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let manager_arc = match manager_weak.upgrade() {
                 Some(arc) => arc,
                 None => {
-                    log::warn!(
-                        "WebRTCManager instance dropped before data channel was established."
-                    );
-                    return Box::pin(async {});
+                    return Box::pin(async {
+                        log::warn!("WebRTCManager dropped before data channel established.")
+                    })
                 }
             };
-
             log::info!("New DataChannel '{}' with ID {}.", dc.label(), dc.id());
 
-            // Define the message handler for this specific data channel.
             let dc_clone = dc.clone();
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                // Clone the Arc to move it into the async block.
                 let manager_clone = manager_arc.clone();
-                let dc_clone2 = dc_clone.clone();
+                let dc_clone = dc_clone.clone();
                 Box::pin(async move {
-                    if let Err(e) = manager_clone.handle_message(msg, dc_clone2).await {
+                    if let Err(e) = manager_clone.handle_message(msg, dc_clone).await {
                         log::error!("Error handling data channel message: {}", e);
                     }
                 })
             }));
-
             Box::pin(async {})
         }));
-
         Ok(manager)
     }
 
-    // Handles an incoming SDP offer, creates an answer, and sets the local description.
     pub async fn handle_offer_and_create_answer(
         &self,
         offer: RTCSessionDescription,
@@ -134,19 +166,18 @@ impl WebRTCManager {
         self.peer_connection
             .local_description()
             .await
-            .ok_or_else(|| anyhow!("Local description not available after setting answer"))
+            .ok_or_else(|| anyhow!("Local description not available"))
     }
 
-    // Deserializes and adds an ICE candidate received from the peer.
     pub async fn add_ice_candidate(&self, candidate_json: String) -> Result<()> {
-        let candidate = serde_json::from_str::<
-            webrtc::ice_transport::ice_candidate::RTCIceCandidateInit,
-        >(&candidate_json)?;
+        let candidate =
+            serde_json::from_str::<webrtc::ice_transport::ice_candidate::RTCIceCandidateInit>(
+                &candidate_json,
+            )?;
         self.peer_connection.add_ice_candidate(candidate).await?;
         Ok(())
     }
 
-    // Main message handler, called from the `on_message` callback.
     async fn handle_message(
         &self,
         msg: DataChannelMessage,
@@ -160,14 +191,12 @@ impl WebRTCManager {
         Ok(())
     }
 
-    // Handles JSON control messages from the client.
     async fn handle_control_message(
         &self,
         data: &[u8],
         data_channel: Arc<RTCDataChannel>,
     ) -> Result<()> {
-        let text = String::from_utf8_lossy(data);
-        match serde_json::from_str::<ClientMessage>(&text) {
+        match serde_json::from_slice::<ClientMessage>(data) {
             Ok(message) => match message {
                 ClientMessage::Upload { chunk_id } => {
                     log::info!("Received UPLOAD request for chunk_id: {}", chunk_id);
@@ -182,34 +211,32 @@ impl WebRTCManager {
                     *self.current_upload_chunk_id.lock().await = Some(chunk_id);
                 }
                 ClientMessage::Download { chunk_id } => {
-                    log::info!("Received DOWNLOAD request for chunk_id: {}", chunk_id);
-                    let manager = self.clone_for_task();
+                    let manager_clone = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = manager
-                            .handle_download_request(&chunk_id, data_channel)
-                            .await
+                        if let Err(e) =
+                            manager_clone.handle_download_request(&chunk_id, data_channel).await
                         {
-                            log::error!("Error during download for chunk {}: {}", chunk_id, e);
+                            log::error!("Error in download task for chunk {}: {}", chunk_id, e);
                         }
                     });
                 }
-                ClientMessage::DeleteChunk { chunk_id } => {
-                    log::info!("Received DELETE request for chunk_id: {}", chunk_id);
-                    let manager = self.clone_for_task();
+                ClientMessage::Delete { chunk_id } => {
+                    let manager_clone = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = manager.handle_delete_request(&chunk_id, data_channel).await
+                        if let Err(e) =
+                            manager_clone.handle_delete_request(&chunk_id, data_channel).await
                         {
-                            log::error!("Error during delete for chunk {}: {}", chunk_id, e);
+                            log::error!("Error in delete task for chunk {}: {}", chunk_id, e);
                         }
                     });
                 }
-                ClientMessage::CheckChunk { chunk_id } => {
-                    log::info!("Received CHECK request for chunk_id: {}", chunk_id);
-                    let manager = self.clone_for_task();
+                ClientMessage::CheckId { chunk_id } => {
+                    let manager_clone = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = manager.handle_check_request(&chunk_id, data_channel).await
+                        if let Err(e) =
+                            manager_clone.handle_check_request(&chunk_id, data_channel).await
                         {
-                            log::error!("Error during check for chunk {}: {}", chunk_id, e);
+                            log::error!("Error in check task for chunk {}: {}", chunk_id, e);
                         }
                     });
                 }
@@ -221,26 +248,17 @@ impl WebRTCManager {
                     self.finalize_upload(&chunk_id, data_channel).await?;
                     *self.current_upload_chunk_id.lock().await = None;
                 }
-                _ => log::warn!("Received unexpected client message type: {}", text),
+                _ => log::warn!("Received unexpected client message type"),
             },
-            Err(e) => log::warn!("Failed to parse control message: {}. Raw: '{}'", e, text),
+            Err(e) => log::warn!("Failed to parse control message: {}", e),
         };
         Ok(())
     }
 
-    // Handles incoming binary data for the currently active upload.
     async fn handle_data_chunk(&self, data: &[u8]) -> Result<()> {
-        match &*self.current_upload_chunk_id.lock().await {
-            Some(chunk_id) => {
-                let mut uploads = self.active_uploads.lock().await;
-                if let Some(session) = uploads.get_mut(chunk_id) {
-                    session.buffer.extend_from_slice(data);
-                } else {
-                    log::error!("Received data for non-existent session: {}", chunk_id);
-                }
-            }
-            _ => {
-                log::warn!("Received unexpected binary data with no active upload.");
+        if let Some(chunk_id) = &*self.current_upload_chunk_id.lock().await {
+            if let Some(session) = self.active_uploads.lock().await.get_mut(chunk_id) {
+                session.buffer.extend_from_slice(data);
             }
         }
         Ok(())
@@ -251,40 +269,25 @@ impl WebRTCManager {
         chunk_id: &str,
         data_channel: Arc<RTCDataChannel>,
     ) -> Result<()> {
-        let mut uploads = self.active_uploads.lock().await;
-        if let Some(session) = uploads.remove(chunk_id) {
-            log::info!(
-                "Finalizing upload for chunk {}. Total size: {} bytes",
-                chunk_id,
-                session.buffer.len()
-            );
-            match storage::store_chunk_data_to_disk(
+        if let Some(session) = self.active_uploads.lock().await.remove(chunk_id) {
+            storage::store_chunk_data_to_disk(
                 &self.storage_path,
                 &session.chunk_id,
                 &session.buffer,
                 self.storage_state.clone(),
             )
-            .await
-            {
-                Ok(_) => {
-                    let msg = ClientMessage::TransferComplete {
-                        chunk_id: chunk_id.to_string(),
-                    };
-                    data_channel.send_text(serde_json::to_string(&msg)?).await?;
-                }
-                Err(e) => {
-                    self.send_error(chunk_id, &e.to_string(), &data_channel)
-                        .await?;
-                    return Err(e);
-                }
-            }
+            .await?;
+            let msg = ClientMessage::TransferComplete {
+                chunk_id: chunk_id.to_string(),
+            };
+            data_channel
+                .send_text(serde_json::to_string(&msg)?)
+                .await?;
         } else {
-            let err_msg = format!(
+            return Err(anyhow!(
                 "Cannot finalize: No upload session for chunk_id: {}",
                 chunk_id
-            );
-            self.send_error(chunk_id, &err_msg, &data_channel).await?;
-            return Err(anyhow!(err_msg));
+            ));
         }
         Ok(())
     }
@@ -294,22 +297,23 @@ impl WebRTCManager {
         chunk_id: &str,
         data_channel: Arc<RTCDataChannel>,
     ) -> Result<()> {
-        match storage::retrieve_chunk_data_from_disk(&self.storage_path, chunk_id).await {
-            Ok(data) => {
-                for chunk in data.chunks(16 * 1024) {
-                    wait_for_data_channel_buffer(&data_channel).await;
-                    data_channel.send(&Bytes::copy_from_slice(chunk)).await?;
-                }
-                let msg = ClientMessage::TransferComplete {
-                    chunk_id: chunk_id.to_string(),
-                };
-                data_channel.send_text(serde_json::to_string(&msg)?).await?;
-            }
-            Err(e) => {
-                self.send_error(chunk_id, &e.to_string(), &data_channel)
-                    .await?
-            }
+        let data = storage::retrieve_chunk_data_from_disk(
+            &self.storage_path,
+            chunk_id,
+        )
+        .await?;
+        for chunk in data.chunks(16 * 1024) {
+            wait_for_data_channel_buffer(&data_channel).await;
+            data_channel
+                .send(&Bytes::copy_from_slice(chunk))
+                .await?;
         }
+        let msg = ClientMessage::TransferComplete {
+            chunk_id: chunk_id.to_string(),
+        };
+        data_channel
+            .send_text(serde_json::to_string(&msg)?)
+            .await?;
         Ok(())
     }
 
@@ -318,24 +322,18 @@ impl WebRTCManager {
         chunk_id: &str,
         data_channel: Arc<RTCDataChannel>,
     ) -> Result<()> {
-        match storage::delete_chunk_from_disk(
+        storage::delete_chunk_from_disk(
             &self.storage_path,
             chunk_id,
             self.storage_state.clone(),
         )
-        .await
-        {
-            Ok(_) => {
-                let msg = ClientMessage::TransferComplete {
-                    chunk_id: chunk_id.to_string(),
-                };
-                data_channel.send_text(serde_json::to_string(&msg)?).await?;
-            }
-            Err(e) => {
-                self.send_error(chunk_id, &e.to_string(), &data_channel)
-                    .await?
-            }
-        }
+        .await?;
+        let msg = ClientMessage::TransferComplete {
+            chunk_id: chunk_id.to_string(),
+        };
+        data_channel
+            .send_text(serde_json::to_string(&msg)?)
+            .await?;
         Ok(())
     }
 
@@ -344,24 +342,20 @@ impl WebRTCManager {
         chunk_id: &str,
         data_channel: Arc<RTCDataChannel>,
     ) -> Result<()> {
-        match storage::check_chunk_exists(&self.storage_path, chunk_id).await {
-            Ok(exists) => {
-                let msg = ClientMessage::ChunkStatus {
-                    chunk_id: chunk_id.to_string(),
-                    exists,
-                };
-                data_channel.send_text(serde_json::to_string(&msg)?).await?;
-            }
-            Err(e) => {
-                self.send_error(chunk_id, &e.to_string(), &data_channel)
-                    .await?
-            }
-        }
+        let exists = storage::check_chunk_exists(&self.storage_path, chunk_id).await?;
+        let msg = ClientMessage::IdStatus {
+            chunk_id: chunk_id.to_string(),
+            exists,
+        };
+        data_channel
+            .send_text(serde_json::to_string(&msg)?)
+            .await?;
         Ok(())
     }
+}
 
-    // Creates a clone of the necessary state for spawning a new async task.
-    fn clone_for_task(&self) -> Self {
+impl Clone for WebRTCManager {
+    fn clone(&self) -> Self {
         Self {
             peer_connection: self.peer_connection.clone(),
             storage_path: self.storage_path.clone(),
@@ -369,21 +363,5 @@ impl WebRTCManager {
             active_uploads: self.active_uploads.clone(),
             current_upload_chunk_id: self.current_upload_chunk_id.clone(),
         }
-    }
-
-    // Sends a formatted error message to the client.
-    async fn send_error(
-        &self,
-        chunk_id: &str,
-        error: &str,
-        dc: &Arc<RTCDataChannel>,
-    ) -> Result<()> {
-        log::error!("Error for chunk {}: {}", chunk_id, error);
-        let err_msg = ClientMessage::TransferError {
-            chunk_id: chunk_id.to_string(),
-            error: error.to_string(),
-        };
-        dc.send_text(serde_json::to_string(&err_msg)?).await?;
-        Ok(())
     }
 }
