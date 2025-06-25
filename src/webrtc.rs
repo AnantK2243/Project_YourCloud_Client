@@ -74,27 +74,15 @@ impl WebRTCManager {
         storage_state: Arc<StorageState>,
         response_tx: mpsc::Sender<Message>,
         session_id: String,
+        config: RTCConfiguration,
     ) -> Result<Arc<Self>> {
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_network_types(vec![webrtc::ice::network_type::NetworkType::Udp4]);
-
+        
         let api = APIBuilder::new().with_setting_engine(setting_engine).build();
-
-        let config = RTCConfiguration {
-            ice_servers: vec![
-                RTCIceServer {
-                    urls: vec![
-                        "stun:stun.l.google.com:19302".to_owned(),
-                        "stun:global.stun.twilio.com:3478".to_owned(),
-                    ],
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
         
         let pc = Arc::new(api.new_peer_connection(config).await?);
-
+        
         let manager = Arc::new(Self {
             peer_connection: pc.clone(),
             storage_path,

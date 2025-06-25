@@ -39,6 +39,7 @@ pub async fn handle_command(
     storage_state: Arc<StorageState>,
     webrtc_connections: WebRTCConnections,
     storage_path: PathBuf,
+    rtc_config: RTCConfiguration,
 ) -> Result<()> {
     match command {
         BackendCommand::WebRtcOffer { command_id, offer } => {
@@ -53,8 +54,8 @@ pub async fn handle_command(
                 storage_state,
                 response_tx.clone(),
                 command_id.clone(),
-            )
-            .await?;
+                rtc_config,
+            ).await?;
 
             webrtc_connections.lock().await.insert(command_id.clone(), manager.clone());
 

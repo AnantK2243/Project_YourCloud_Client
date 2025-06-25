@@ -14,6 +14,9 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{connect_async_tls_with_config, connect_async_with_config, Connector};
+use reqwest;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::ice_transport::ice_server::RTCIceServer;
 
 /// Represents a status report sent back to the proxy server.
 #[derive(Serialize)]
@@ -266,6 +269,49 @@ pub async fn send_status_report(
     Ok(())
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct TurnCredentialsResponse {
+    pub ice_servers: Vec<IceServer>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IceServer {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
+
+async fn get_turn_credentials(api_url: &str, auth_token: &str) -> Result<RTCConfiguration> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&format!("{}/turn-credentials", api_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .send()
+        .await
+        .context("Failed to send request to /turn-credentials endpoint")?
+        .json::<TurnCredentialsResponse>()
+        .await
+        .context("Failed to parse JSON response from /turn-credentials")?;
+
+    // Manually map the fields from the response struct to the webrtc-rs struct
+    let ice_servers = response
+        .ice_servers
+        .into_iter()
+        .map(|s| RTCIceServer {
+            urls: s.urls,
+            username: s.username.unwrap_or_default(),
+            credential: s.credential.unwrap_or_default(),
+            ..Default::default()
+        })
+        .collect();
+
+    Ok(RTCConfiguration {
+        ice_servers,
+        ..Default::default()
+    })
+}
+
+
 /// Initializes and starts the primary communication loop and command handler task.
 pub async fn start_communication_loop(
     config: Config,
@@ -300,18 +346,33 @@ pub async fn start_communication_loop(
     let storage_state_clone = storage_state.clone();
     let storage_path_clone = config.storage_path.clone();
 
+    // Fetch TURN credentials before starting the command handler
+    let rtc_config = match get_turn_credentials(&config.api_url, &config.auth_token).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to get TURN credentials: {}. Falling back to STUN only.", e);
+            // Fallback configuration
+            RTCConfiguration {
+                ice_servers: vec![RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+    };
+
     // Spawn the command handler task
     tokio::spawn(async move {
         while let Some(command) = backend_command_rx.recv().await {
             debug!("Command handler received: {:?}", command);
-            // NOTE: The signature for `handle_command` must be updated in `commands.rs`
-            // to accept the `storage_path` argument.
             if let Err(e) = commands::handle_command(
                 command,
                 responses_tx_clone.clone(),
                 storage_state_clone.clone(),
                 webrtc_connections_clone.clone(),
                 storage_path_clone.clone(), // Pass storage path
+                rtc_config.clone(),
             )
             .await
             {
