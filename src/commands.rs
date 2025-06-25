@@ -3,8 +3,7 @@
 use crate::network;
 use crate::storage;
 use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose, Engine as _};
-use log::{error, info, warn};
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -24,13 +23,18 @@ pub enum BackendCommand {
     StoreChunk {
         command_id: String,
         chunk_id: String,
-        data: String,
+        data_size: u64,
+        binary_data: Option<Vec<u8>>,
     },
     GetChunk {
         command_id: String,
         chunk_id: String,
     },
     DeleteChunk {
+        command_id: String,
+        chunk_id: String,
+    },
+    CheckChunk {
         command_id: String,
         chunk_id: String,
     },
@@ -113,58 +117,87 @@ async fn handle_backend_command(
     current_chunk_count: Arc<AtomicU64>,
 ) -> Result<()> {
     match command {
-        // Store chunk data directly
+        // Store chunk data
         BackendCommand::StoreChunk {
             command_id,
             chunk_id,
-            data,
+            data_size,
+            binary_data,
         } => {
-            info!("Handling StoreChunk: {}", chunk_id);
-
-            // Decode base64 data
-            let result = match general_purpose::STANDARD.decode(&data) {
-                Ok(chunk_data) => {
-                    match storage::store_chunk_data_to_disk(
-                        &storage_path,
-                        &chunk_id,
-                        &chunk_data,
-                        &current_used_space_bytes,
-                        &max_storage_bytes,
-                        &current_chunk_count,
-                    )
-                    .await
-                    {
-                        Ok(chunk_size) => {
-                            // Send positive storage delta for stored chunk
-                            send_result(&response_tx, command_id, Ok(()), Some(chunk_size as i64))
+            let result = match binary_data {
+                Some(chunk_data) => {
+                    // Verify data size matches expected
+                    if chunk_data.len() != data_size as usize {
+                        Err(anyhow!(
+                            "Binary data size mismatch: expected {}, got {}",
+                            data_size,
+                            chunk_data.len()
+                        ))
+                    } else {
+                        match storage::store_chunk_data_to_disk(
+                            &storage_path,
+                            &chunk_id,
+                            &chunk_data,
+                            &current_used_space_bytes,
+                            &max_storage_bytes,
+                            &current_chunk_count,
+                        )
+                        .await
+                        {
+                            Ok(chunk_size) => {
+                                // Send positive storage delta for stored chunk
+                                send_result(
+                                    &response_tx,
+                                    command_id,
+                                    Ok(()),
+                                    Some(chunk_size as i64),
+                                )
                                 .await?;
-                        }
-                        Err(e) => {
-                            send_result(&response_tx, command_id, Err(e), None).await?;
+                                return Ok(());
+                            }
+                            Err(e) => Err(e),
                         }
                     }
-                    return Ok(());
                 }
-                Err(e) => Err(anyhow!("Failed to decode base64 data: {}", e)),
+                None => Err(anyhow!("No binary data provided for STORE_CHUNK command")),
             };
 
             send_result(&response_tx, command_id, result, None).await?;
         }
 
-        // Get chunk and return data directly
+        // Get chunk and return binary data
         BackendCommand::GetChunk {
             command_id,
             chunk_id,
         } => {
-            info!("Handling GetChunk: {}", chunk_id);
+            // Validate chunk_id
+            if chunk_id.is_empty() || chunk_id.len() > 255 {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: empty or too long")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
 
             let result = storage::retrieve_chunk_data_from_disk(&storage_path, &chunk_id).await;
 
             match result {
                 Ok(chunk_data) => {
-                    // Encode data as base64 and send back
-                    let encoded_data = general_purpose::STANDARD.encode(&chunk_data);
-                    network::send_chunk_data(&response_tx, command_id, encoded_data).await?;
+                    network::send_chunk_data(&response_tx, command_id, chunk_data).await?;
                 }
                 Err(e) => {
                     send_result(&response_tx, command_id, Err(e), None).await?;
@@ -177,7 +210,28 @@ async fn handle_backend_command(
             command_id,
             chunk_id,
         } => {
-            info!("Handling DeleteChunk: {}", chunk_id);
+            // Validate chunk_id
+            if chunk_id.is_empty() || chunk_id.len() > 255 {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: empty or too long")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
 
             match storage::delete_chunk_from_disk(
                 &storage_path,
@@ -207,10 +261,47 @@ async fn handle_backend_command(
             }
         }
 
+        // Check if chunk exists
+        BackendCommand::CheckChunk {
+            command_id,
+            chunk_id,
+        } => {
+            // Validate chunk_id
+            if chunk_id.is_empty() || chunk_id.len() > 255 {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: empty or too long")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let exists = storage::check_chunk_exists(&storage_path, &chunk_id).await;
+            match exists {
+                Ok(found) => {
+                    network::send_check_response(&response_tx, command_id, found).await?;
+                }
+                Err(e) => {
+                    send_result(&response_tx, command_id, Err(e), None).await?;
+                }
+            }
+        }
+
         // Handle status request from server
         BackendCommand::StatusRequest { command_id } => {
-            info!("Handling StatusRequest");
-
             let status = NodeStatus {
                 used_space_bytes: current_used_space_bytes.load(Ordering::Relaxed),
                 max_space_bytes: max_storage_bytes.load(Ordering::Relaxed),
