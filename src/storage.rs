@@ -138,7 +138,7 @@ pub async fn store_chunk_data_to_disk(
 
     if current_used.saturating_add(chunk_size) > current_max {
         return Err(anyhow!(
-            "Insufficient configured storage space. Required: {}, Available within limit: {}. Current used: {}/{}",
+            "Insufficient space error - Configured storage limit exceeded. Required: {}, Available within limit: {}. Current used: {}/{}",
             chunk_size,
             current_max.saturating_sub(current_used),
             current_used,
@@ -151,7 +151,7 @@ pub async fn store_chunk_data_to_disk(
         Ok(available_disk_space) => {
             if chunk_size > available_disk_space {
                 return Err(anyhow!(
-                    "Insufficient disk space. Required: {}, Available: {}",
+                    "Insufficient space error - Storage Full. Required: {}, Available: {}",
                     chunk_size,
                     available_disk_space
                 ));

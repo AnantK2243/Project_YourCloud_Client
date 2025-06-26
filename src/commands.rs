@@ -23,19 +23,15 @@ pub struct NodeStatus {
 pub enum BackendCommand {
     StoreChunk {
         command_id: String,
-        chunk_id: String,
         data_size: u64,
         binary_data: Option<Vec<u8>>,
+        chunk_id: String,
     },
     GetChunk {
         command_id: String,
         chunk_id: String,
     },
     DeleteChunk {
-        command_id: String,
-        chunk_id: String,
-    },
-    CheckChunk {
         command_id: String,
         chunk_id: String,
     },
@@ -58,10 +54,35 @@ pub async fn handle_command(
         // Store chunk data
         BackendCommand::StoreChunk {
             command_id,
-            chunk_id,
             data_size,
             binary_data,
+            chunk_id,
         } => {
+            // Validate chunk_id
+            if uuid::Uuid::parse_str(&chunk_id).is_err() {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    chunk_id,
+                    Err(anyhow!("Invalid chunk_id: not a valid UUID")),
+                    None,
+                ).await?;
+                return Ok(());
+            }
+
+            // Check if chunk_id already exists
+            if storage::check_chunk_exists(&storage_path, &chunk_id).await? {
+                send_result(
+                    &response_tx,
+                    command_id,
+                    chunk_id.clone(),
+                    Err(anyhow!("Chunk ID collision: {} already exists", chunk_id)),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+
             let result = match binary_data {
                 Some(chunk_data) => {
                     // Verify data size matches expected
@@ -87,6 +108,7 @@ pub async fn handle_command(
                                 send_result(
                                     &response_tx,
                                     command_id,
+                                    chunk_id.clone(),
                                     Ok(()),
                                     Some(chunk_size as i64),
                                 )
@@ -100,7 +122,14 @@ pub async fn handle_command(
                 None => Err(anyhow!("No binary data provided for STORE_CHUNK command")),
             };
 
-            send_result(&response_tx, command_id, result, None).await?;
+            // Store failed - send error response
+            send_result(
+                &response_tx,
+                command_id,
+                chunk_id,
+                result,
+                None
+            ).await?;
         }
 
         // Get chunk and return binary data
@@ -109,25 +138,14 @@ pub async fn handle_command(
             chunk_id,
         } => {
             // Validate chunk_id
-            if chunk_id.is_empty() || chunk_id.len() > 255 {
+            if uuid::Uuid::parse_str(&chunk_id).is_err() {
                 send_result(
                     &response_tx,
                     command_id,
-                    Err(anyhow!("Invalid chunk_id: empty or too long")),
+                    chunk_id,
+                    Err(anyhow!("Invalid chunk_id: not a valid UUID")),
                     None,
-                )
-                .await?;
-                return Ok(());
-            }
-
-            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
-                    None,
-                )
-                .await?;
+                ).await?;
                 return Ok(());
             }
 
@@ -138,7 +156,13 @@ pub async fn handle_command(
                     network::send_chunk_data(&response_tx, command_id, chunk_data).await?;
                 }
                 Err(e) => {
-                    send_result(&response_tx, command_id, Err(e), None).await?;
+                    send_result(
+                        &response_tx,
+                        command_id,
+                        chunk_id,
+                        Err(e),
+                        None
+                    ).await?;
                 }
             }
         }
@@ -149,25 +173,14 @@ pub async fn handle_command(
             chunk_id,
         } => {
             // Validate chunk_id
-            if chunk_id.is_empty() || chunk_id.len() > 255 {
+            if uuid::Uuid::parse_str(&chunk_id).is_err() {
                 send_result(
                     &response_tx,
                     command_id,
-                    Err(anyhow!("Invalid chunk_id: empty or too long")),
+                    chunk_id,
+                    Err(anyhow!("Invalid chunk_id: not a valid UUID")),
                     None,
-                )
-                .await?;
-                return Ok(());
-            }
-
-            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
-                    None,
-                )
-                .await?;
+                ).await?;
                 return Ok(());
             }
 
@@ -184,6 +197,7 @@ pub async fn handle_command(
                     send_result(
                         &response_tx,
                         command_id,
+                        chunk_id,
                         Ok(()),
                         Some(-(deleted_size as i64)),
                     )
@@ -191,49 +205,22 @@ pub async fn handle_command(
                 }
                 Ok(None) => {
                     // Chunk didn't exist, no storage change
-                    send_result(&response_tx, command_id, Ok(()), None).await?;
+                    send_result(
+                        &response_tx,
+                        command_id,
+                        chunk_id,
+                        Ok(()),
+                        None
+                    ).await?;
                 }
                 Err(e) => {
-                    send_result(&response_tx, command_id, Err(e), None).await?;
-                }
-            }
-        }
-
-        // Check if chunk exists
-        BackendCommand::CheckChunk {
-            command_id,
-            chunk_id,
-        } => {
-            // Validate chunk_id
-            if chunk_id.is_empty() || chunk_id.len() > 255 {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: empty or too long")),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-
-            if chunk_id.contains("..") || chunk_id.contains("/") || chunk_id.contains("\\") {
-                send_result(
-                    &response_tx,
-                    command_id,
-                    Err(anyhow!("Invalid chunk_id: contains unsafe characters")),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-
-            let exists = storage::check_chunk_exists(&storage_path, &chunk_id).await;
-            match exists {
-                Ok(found) => {
-                    network::send_check_response(&response_tx, command_id, found).await?;
-                }
-                Err(e) => {
-                    send_result(&response_tx, command_id, Err(e), None).await?;
+                    send_result(
+                        &response_tx,
+                        command_id,
+                        chunk_id,
+                        Err(e),
+                        None
+                    ).await?;
                 }
             }
         }
@@ -261,11 +248,12 @@ pub async fn handle_command(
 async fn send_result(
     response_tx: &mpsc::Sender<Message>,
     command_id: String,
+    chunk_id: String,
     result: Result<()>,
     storage_delta: Option<i64>,
 ) -> Result<()> {
     if let Err(e) = &result {
         error!("Operation for command {} failed: {}", command_id, e);
     }
-    network::send_command_result(response_tx, command_id, result, storage_delta).await
+    network::send_command_result(response_tx, command_id, chunk_id, result, storage_delta).await
 }
