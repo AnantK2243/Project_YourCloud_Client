@@ -105,6 +105,51 @@ pub async fn initialize_storage_state(
     Ok((current_used_space, max_bytes, current_chunk_count))
 }
 
+pub async fn validate_chunk_storage_limits(
+    storage_path_base: &Path,
+    chunk_size: u64,
+    current_used_space_bytes: &Arc<AtomicU64>,
+    max_storage_bytes: &Arc<AtomicU64>,
+) -> Result<()> {
+    // Validate chunk size is reasonable
+    if chunk_size > 1024 * 1024 * 1024 {
+        return Err(anyhow!("Chunk too large: {} bytes", chunk_size));
+    }
+
+    // Check user set storage limit with overflow protection
+    let current_max = max_storage_bytes.load(Ordering::Acquire);
+    let current_used = current_used_space_bytes.load(Ordering::Acquire);
+
+    if current_used.saturating_add(chunk_size) > current_max {
+        return Err(anyhow!(
+            "Insufficient space error - Configured storage limit exceeded. Required: {}, Available within limit: {}. Current used: {}/{}",
+            chunk_size,
+            current_max.saturating_sub(current_used),
+            current_used,
+            current_max
+        ));
+    }
+
+    // Check actual available system disk space
+    match get_disk_available_space(storage_path_base) {
+        Ok(available_disk_space) => {
+            if chunk_size > available_disk_space {
+                return Err(anyhow!(
+                    "Insufficient space error - Storage Full. Required: {}, Available: {}",
+                    chunk_size,
+                    available_disk_space
+                ));
+            }
+        }
+        Err(e) => {
+            error!("Could not verify disk space: {}", e);
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn store_chunk_data_to_disk(
     storage_path_base: &Path,
     chunk_id: &str,
@@ -127,10 +172,13 @@ pub async fn store_chunk_data_to_disk(
     let chunk_path = storage_path_base.join(chunk_id);
     let chunk_size = chunk_data.len() as u64;
 
-    // Validate chunk size is reasonable
-    if chunk_size > 1024 * 1024 * 1024 {
-        return Err(anyhow!("Chunk too large: {} bytes", chunk_size));
-    }
+    // Validate chunk size and space limits
+    validate_chunk_storage_limits(
+        storage_path_base,
+        chunk_size,
+        current_used_space_bytes,
+        max_storage_bytes,
+    ).await?;
 
     // Check user set storage limit with overflow protection
     let current_max = max_storage_bytes.load(Ordering::Acquire);
