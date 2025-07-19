@@ -178,7 +178,8 @@ pub async fn store_chunk_data_to_disk(
         chunk_size,
         current_used_space_bytes,
         max_storage_bytes,
-    ).await?;
+    )
+    .await?;
 
     // Check user set storage limit with overflow protection
     let current_max = max_storage_bytes.load(Ordering::Acquire);

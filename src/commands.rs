@@ -2,7 +2,7 @@
 
 use crate::network;
 use crate::storage;
-use anyhow::{anyhow, Result, Context};
+use anyhow::{anyhow, Context, Result};
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicU64;
@@ -80,7 +80,8 @@ pub async fn handle_command(
                     chunk_id,
                     Err(anyhow!("Invalid chunk_id: not a valid UUID")),
                     None,
-                ).await?;
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -137,13 +138,7 @@ pub async fn handle_command(
             };
 
             // Store failed - send error response
-            send_result(
-                &response_tx,
-                command_id,
-                chunk_id,
-                result,
-                None
-            ).await?;
+            send_result(&response_tx, command_id, chunk_id, result, None).await?;
             return Ok::<(), anyhow::Error>(());
         }
 
@@ -160,7 +155,8 @@ pub async fn handle_command(
                     chunk_id,
                     Err(anyhow!("Invalid chunk_id: not a valid UUID")),
                     None,
-                ).await?;
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -172,13 +168,7 @@ pub async fn handle_command(
                     return Ok(());
                 }
                 Err(e) => {
-                    send_result(
-                        &response_tx,
-                        command_id,
-                        chunk_id,
-                        Err(e),
-                        None
-                    ).await?;
+                    send_result(&response_tx, command_id, chunk_id, Err(e), None).await?;
                     return Ok::<(), anyhow::Error>(());
                 }
             }
@@ -197,7 +187,8 @@ pub async fn handle_command(
                     chunk_id,
                     Err(anyhow!("Invalid chunk_id: not a valid UUID")),
                     None,
-                ).await?;
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -223,32 +214,18 @@ pub async fn handle_command(
                 }
                 Ok(None) => {
                     // Chunk didn't exist, no storage change
-                    send_result(
-                        &response_tx,
-                        command_id,
-                        chunk_id,
-                        Ok(()),
-                        None
-                    ).await?;
+                    send_result(&response_tx, command_id, chunk_id, Ok(()), None).await?;
                     return Ok(());
                 }
                 Err(e) => {
-                    send_result(
-                        &response_tx,
-                        command_id,
-                        chunk_id,
-                        Err(e),
-                        None
-                    ).await?;
+                    send_result(&response_tx, command_id, chunk_id, Err(e), None).await?;
                     return Ok::<(), anyhow::Error>(());
                 }
             }
         }
 
         // Handle status request from server
-        BackendCommand::StatusRequest {
-            command_id,
-        } => {
+        BackendCommand::StatusRequest { command_id } => {
             let status = NodeStatus {
                 used_space_bytes: current_used_space_bytes.load(Ordering::Relaxed),
                 max_space_bytes: max_storage_bytes.load(Ordering::Relaxed),
@@ -269,16 +246,12 @@ pub async fn handle_command(
                 data_size,
                 &current_used_space_bytes,
                 &max_storage_bytes,
-            ).await {
+            )
+            .await
+            {
                 Ok(()) => {}
                 Err(e) => {
-                    send_result(
-                        &response_tx,
-                        command_id,
-                        String::new(),
-                        Err(e),
-                        None
-                    ).await?;
+                    send_result(&response_tx, command_id, String::new(), Err(e), None).await?;
                     return Ok(());
                 }
             }
@@ -290,31 +263,38 @@ pub async fn handle_command(
                     break candidate;
                 }
             };
-            send_result(
-                &response_tx, 
-                command_id, 
-                chunk_id, 
-                Ok(()), 
-                None,
-            ).await?;
+            send_result(&response_tx, command_id, chunk_id, Ok(()), None).await?;
             return Ok(());
         }
-        
-        BackendCommand::DownloadAndStoreChunk { command_id, chunk_id, download_url } => {
+
+        BackendCommand::DownloadAndStoreChunk {
+            command_id,
+            chunk_id,
+            download_url,
+        } => {
             let client = reqwest::Client::new();
 
             // Download and store the chunk
             let result = async {
-                let response = client.get(&download_url).send().await
+                let response = client
+                    .get(&download_url)
+                    .send()
+                    .await
                     .context("Failed to send download request to R2")?;
 
                 if !response.status().is_success() {
                     let status = response.status();
                     let error_body = response.text().await.unwrap_or_default();
-                    return Err(anyhow!("R2 download failed with status {}: {}", status, error_body));
+                    return Err(anyhow!(
+                        "R2 download failed with status {}: {}",
+                        status,
+                        error_body
+                    ));
                 }
 
-                let chunk_data = response.bytes().await
+                let chunk_data = response
+                    .bytes()
+                    .await
                     .context("Failed to read downloaded bytes from R2")?;
 
                 storage::store_chunk_data_to_disk(
@@ -328,70 +308,60 @@ pub async fn handle_command(
                 .await
                 .map(|chunk_size| Some(chunk_size as i64))
                 .map_err(|e| e)
-            }.await;
+            }
+            .await;
 
             match result {
                 Ok(Some(chunk_size)) => {
-                    send_result(
-                        &response_tx,
-                        command_id,
-                        chunk_id,
-                        Ok(()),
-                        Some(chunk_size),
-                    ).await?;
+                    send_result(&response_tx, command_id, chunk_id, Ok(()), Some(chunk_size))
+                        .await?;
                     return Ok(());
                 }
                 Ok(None) => {
-                    send_result(
-                        &response_tx,
-                        command_id,
-                        chunk_id,
-                        Ok(()),
-                        None,
-                    ).await?;
+                    send_result(&response_tx, command_id, chunk_id, Ok(()), None).await?;
                     return Ok(());
                 }
                 Err(e) => {
-                    send_result(
-                        &response_tx,
-                        command_id,
-                        chunk_id,
-                        Err(e),
-                        None,
-                    ).await?;
+                    send_result(&response_tx, command_id, chunk_id, Err(e), None).await?;
                     return Ok(());
                 }
             }
         }
-        BackendCommand::RetrieveAndUploadChunk { command_id, chunk_id, upload_url } => {
+        BackendCommand::RetrieveAndUploadChunk {
+            command_id,
+            chunk_id,
+            upload_url,
+        } => {
             let client = reqwest::Client::new();
 
             // Perform the retrieval and upload within an async block.
             let result = async {
-                let chunk_data = storage::retrieve_chunk_data_from_disk(&storage_path, &chunk_id).await
+                let chunk_data = storage::retrieve_chunk_data_from_disk(&storage_path, &chunk_id)
+                    .await
                     .context("Failed to read chunk from disk for upload")?;
-                
-                let response = client.put(&upload_url)
+
+                let response = client
+                    .put(&upload_url)
                     .header("Content-Type", "application/octet-stream")
                     .body(chunk_data)
-                    .send().await
+                    .send()
+                    .await
                     .context("Failed to send upload request to R2")?;
 
                 if !response.status().is_success() {
                     let status = response.status();
                     let error_body = response.text().await.unwrap_or_default();
-                    return Err(anyhow!("R2 upload failed with status {}: {}", status, error_body));
+                    return Err(anyhow!(
+                        "R2 upload failed with status {}: {}",
+                        status,
+                        error_body
+                    ));
                 }
                 Ok(())
-            }.await;
+            }
+            .await;
 
-            send_result(
-                &response_tx,
-                command_id,
-                chunk_id,
-                result,
-                None,
-            ).await?;
+            send_result(&response_tx, command_id, chunk_id, result, None).await?;
             return Ok(());
         }
 
