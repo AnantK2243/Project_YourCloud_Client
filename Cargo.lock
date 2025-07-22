@@ -3,6 +3,29 @@
 version = 4
 
 [[package]]
+name = "Project_YourCloud_Client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "dirs",
+ "env_logger",
+ "futures-util",
+ "log",
+ "native-tls",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1348,29 +1371,6 @@ name = "stable_deref_trait"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
-
-[[package]]
-name = "storage_client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "dirs",
- "env_logger",
- "futures-util",
- "log",
- "native-tls",
- "reqwest",
- "serde",
- "serde_json",
- "sysinfo",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "toml",
- "uuid",
-]
 
 [[package]]
 name = "syn"

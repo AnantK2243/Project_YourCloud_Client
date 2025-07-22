@@ -2,6 +2,8 @@
 
 set -e  # Exit on any error
 
+export PATH="$HOME/.cargo/bin:$PATH"
+
 # Color codes for better output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
