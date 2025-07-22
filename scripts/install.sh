@@ -99,7 +99,7 @@ DEFAULT_STORAGE_PATH="$HOME/Project_YourCloud"
 prompt_with_default "Enter storage directory path" "$DEFAULT_STORAGE_PATH" STORAGE_PATH
 
 # Get Storage Size
-prompt_with_default "Enter maximum storage size (GB)" "40" MAX_STORAGE_GB
+prompt_with_default "Enter maximum storage size (GiB)" "40" MAX_STORAGE_GB
 
 
 # Step 4: Create configuration file
@@ -113,7 +113,7 @@ cat > "$CONFIG_PATH" << EOF
 node_id = "$NODE_ID"
 auth_token = "$AUTH_TOKEN"
 storage_path = "$STORAGE_PATH"
-max_storage_gb = $MAX_STORAGE_GB
+max_storage_gib = $MAX_STORAGE_GB
 EOF
 
 chmod 600 "$CONFIG_PATH"
