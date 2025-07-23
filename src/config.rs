@@ -14,78 +14,46 @@ pub struct Config {
     pub auth_token: String,
     pub storage_path: PathBuf,
     pub max_storage_gib: f64,
+    pub ws_url: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        // Generate default user storage folder
-        let default_storage_path = dirs::home_dir()
-            .map(|mut path| {
-                path.push("Project_YourCloud");
-                path
-            })
-            .or_else(|| {
-                env::var("USER")
-                    .ok()
-                    .map(|user_name| {
-                        let path = PathBuf::from(format!("/home/{}/Project_YourCloud", user_name));
-                        info!("Using USER env var for storage path: {:?}", path);
-                        path
-                    })
-            })
-            .unwrap_or_else(|| {
-                // Dump to working directory
-                warn!("Could not determine home directory or USER env var. Defaulting storage_path to current directory + 'Project_YourCloud'.");
-                let fallback_path = std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("/tmp"))
-                    .join("Project_YourCloud");
-                info!("Fallback storage path: {:?}", fallback_path);
-                fallback_path
-            });
-
-        info!(
-            "Default config created with storage path: {:?}",
-            default_storage_path
-        );
-
         Self {
             node_id: String::new(),
             auth_token: String::new(),
-            storage_path: default_storage_path,
-            max_storage_gib: 20.0,
+            storage_path: get_default_storage_path(),
+            max_storage_gib: 40.0,
+            ws_url: String::new(),
         }
     }
 }
 
 pub async fn load_config() -> Result<Config> {
     let config_path = get_config_path()?;
-    info!("Loading configuration from: {:?}", config_path);
+    info!("Attempting to load configuration from: {:?}", config_path);
 
+    // TODO: REMOVE, NOW HANDLED MANUALLY
     // First time run, create default config file at path
+    // if !config_path.exists() {
+    //     warn!(
+    //         "Config file not found, creating default at: {:?}",
+    //         config_path
+    //     );
+    //     let default_config = Config::default();
+    //     save_config(&default_config).await?;
+
+    //     // Display warning and stop the program
+    //     info!("DEFAULT CONFIGURATION CREATED, PLEASE RUN WITH SETUP COMMAND TO CONFIGURE");
+
+    //     return Err(anyhow!("Default configuration created. Please configure node_id and auth_token before running again."));
+    // }
+
     if !config_path.exists() {
-        warn!(
-            "Config file not found, creating default at: {:?}",
-            config_path
-        );
-        let default_config = Config::default();
-        save_config(&default_config).await?;
-
-        // Display warning and stop the program
-        warn!("========================================");
-        warn!("DEFAULT CONFIGURATION CREATED");
-        warn!("========================================");
-        warn!(
-            "A default configuration file has been created at: {:?}",
-            config_path
-        );
-        warn!(
-            "Please edit this file to configure your node_id and auth_token before running again."
-        );
-        warn!("You can register your node through the web interface to obtain these credentials.");
-        warn!("Program will now exit.");
-        warn!("========================================");
-
-        return Err(anyhow!("Default configuration created. Please configure node_id and auth_token before running again."));
+        info!("Configuration file does not exist, please run the setup command to configure");
+        return Err(anyhow!(
+            "Configuration file does not exist. Please run the setup command to create it."
+        ));
     }
 
     // Read and return
@@ -101,6 +69,7 @@ pub async fn load_config() -> Result<Config> {
         pub auth_token: String,
         pub storage_path: PathBuf,
         pub max_storage_gib: f64,
+        pub ws_url: String,
     }
 
     let file_config: FileConfig =
@@ -116,10 +85,49 @@ pub async fn load_config() -> Result<Config> {
         auth_token: file_config.auth_token,
         storage_path: file_config.storage_path,
         max_storage_gib: file_config.max_storage_gib,
+        ws_url: file_config.ws_url,
     };
 
     validate_config(&config)?;
     Ok(config)
+}
+
+fn get_default_storage_path() -> PathBuf {
+    // Default storage path is user's home directory + "Project_YourCloud"
+    dirs::home_dir()
+        .map(|mut path| {
+            path.push("Project_YourCloud");
+            path
+        })
+        .or_else(|| {
+            env::var("USER")
+                .ok()
+                .map(|user_name| {
+                    let path = PathBuf::from(format!("/home/{}/Project_YourCloud", user_name));
+                    info!("Using USER env var for storage path: {:?}", path);
+                    path
+                })
+        })
+        .unwrap_or_else(|| {
+            // Dump to working directory
+            warn!("Could not determine home directory or USER env var. Defaulting storage_path to current directory + 'Project_YourCloud'.");
+            let fallback_path = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                .join("Project_YourCloud");
+            info!("Fallback storage path: {:?}", fallback_path);
+            fallback_path
+        })
+}
+
+pub fn make_storage_directory(path: Option<PathBuf>) -> Result<PathBuf> {
+    // Use provided path or generate default user storage folder
+    let storage_path = match path {
+        Some(p) => p,
+        None => get_default_storage_path(),
+    };
+
+    info!("Storage directory created at path: {:?}", storage_path);
+    Ok(storage_path)
 }
 
 pub async fn save_config(config: &Config) -> Result<()> {
@@ -140,6 +148,7 @@ pub async fn save_config(config: &Config) -> Result<()> {
         pub auth_token: String,
         pub storage_path: PathBuf,
         pub max_storage_gib: f64,
+        pub ws_url: String,
     }
 
     let save_config = SaveConfig {
@@ -147,6 +156,7 @@ pub async fn save_config(config: &Config) -> Result<()> {
         auth_token: config.auth_token.clone(),
         storage_path: config.storage_path.clone(),
         max_storage_gib: config.max_storage_gib,
+        ws_url: config.ws_url.clone(),
     };
 
     debug!("Serializing config to TOML");
@@ -161,7 +171,7 @@ pub async fn save_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn get_config_path() -> Result<PathBuf> {
+pub fn get_config_path() -> Result<PathBuf> {
     // Return default user config path or store in /etc directory
     let config_path = dirs::config_dir()
         .map(|dir| {
@@ -179,7 +189,7 @@ fn get_config_path() -> Result<PathBuf> {
     Ok(config_path)
 }
 
-fn validate_config(config: &Config) -> Result<()> {
+pub fn validate_config(config: &Config) -> Result<()> {
     debug!("Validating configuration");
 
     // Non-absolute Path

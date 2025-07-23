@@ -1,89 +1,185 @@
-# Storage Node Daemon
+# Project YourCloud Storage Client
 
-## Overview
+A lightweight, command-line storage node client for the Project YourCloud distributed storage system. Allowing users to manage their own cloud on old or unused devices.
 
-The Storage Node Daemon is a headless service designed to operate as a reliable storage unit in a distributed, self-hosted cloud storage system. It runs on Linux and manages encrypted data chunks, ensuring secure communication with a central backend server.
+## Quick Start
 
-## Features
+### 1. Install
 
--   **Headless Operation**: Runs without direct user interaction.
--   **Encrypted Data Handling**: Only stores and retrieves pre-encrypted data.
--   **Proactive Monitoring**: Monitors storage usage and physical disk space.
--   **Secure Communication**: Uses WebSocket for secure communication with the backend.
+```bash
+# Run the automated installer
+./scripts/install.sh
+```
+
+The installer will:
+
+-   Build the binary from source
+-   Install it to `/usr/local/bin/yourcloud_client`
+-   Run interactive setup to configure your node
+-   Optionally create a systemd service
+
+### 2. Get Credentials
+
+1. Visit your Project YourCloud dashboard
+2. Register a new storage node
+3. Copy the Node ID and Auth Token provided
+
+### 3. Configure
+
+```bash
+# Interactive setup (if not done during install)
+yourcloud_client setup
+```
+
+### 4. Start
+
+```bash
+# Start as daemon
+yourcloud_client start
+
+# Or start as systemd service (if installed)
+sudo systemctl start yourcloud-storage
+```
+
+## Commands
+
+### Basic Commands
+
+```bash
+yourcloud_client start     # Start the storage node daemon
+yourcloud_client status    # Display current status and configuration
+yourcloud_client setup     # Interactive configuration setup
+yourcloud_client validate  # Validate current configuration
+yourcloud_client config    # Show configuration file and contents
+yourcloud_client --help    # Display help information
+```
+
+### System Service Commands (if systemd service is installed)
+
+```bash
+sudo systemctl start yourcloud-storage      # Start service
+sudo systemctl stop yourcloud-storage       # Stop service
+sudo systemctl restart yourcloud-storage    # Restart service
+sudo systemctl status yourcloud-storage     # Check service status
+sudo journalctl -u yourcloud-storage -f     # View live logs
+```
+
+## Configuration
+
+Configuration is stored in `~/.config/Project_YourCloud/config.toml`:
+
+```toml
+node_id = "your-node-id-from-dashboard"
+auth_token = "your-auth-token-from-dashboard"
+storage_path = "/path/to/storage/directory"
+max_storage_gib = 40.0
+ws_url = ""  # Leave empty for default backend
+```
+
+### Configuration Options
+
+-   **node_id**: Unique identifier from your dashboard
+-   **auth_token**: Authentication token from your dashboard
+-   **storage_path**: Directory where chunks will be stored
+-   **max_storage_gib**: Maximum storage to allocate (in GiB)
+-   **ws_url**: Backend WebSocket URL (leave empty for default)
+
+## Manual Installation
+
+If you prefer to install manually:
+
+```bash
+# 1. Build the project
+cargo build --release
+
+# 2. Copy binary (optional)
+sudo cp target/release/Project_YourCloud_Client /usr/local/bin/yourcloud_client
+
+# 3. Configure
+yourcloud_client setup
+
+# 4. Start
+yourcloud_client start
+```
+
+## Troubleshooting
+
+### Common Issues
+
+**Connection Problems**
+
+```bash
+# Check status and configuration
+yourcloud_client status
+
+# Validate configuration
+yourcloud_client validate
+
+# View logs (if using systemd)
+sudo journalctl -u yourcloud-storage -f
+```
+
+**Build Issues**
+
+-   Ensure Rust toolchain is installed: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+-   Update Rust: `rustup update`
+-   Install build dependencies: `sudo apt install build-essential pkg-config libssl-dev`
+
+**Storage Issues**
+
+-   Verify storage directory exists and is writable
+-   Check available disk space
+-   Ensure storage path in config is absolute
+
+### Getting Help
+
+-   Check your node status: `yourcloud_client status`
+-   Validate configuration: `yourcloud_client validate`
+-   View help: `yourcloud_client --help`
+-   Check service logs: `sudo journalctl -u yourcloud-storage -f`
+
+## Uninstallation
+
+To completely remove the storage client:
+
+```bash
+# Run the uninstall script
+./scripts/uninstall.sh
+```
+
+The uninstall script will:
+
+-   Stop and remove the systemd service
+-   Remove the binary and configuration files
+-   Optionally remove storage data (with confirmation)
+-   Clean up logs and processes
+
+## Security Notes
+
+-   Configuration files contain sensitive authentication tokens
+-   Storage directory should only be accessible by the service user
+-   Regularly monitor logs for suspicious activity
+-   Keep the client updated to the latest version
 
 ## Project Structure
 
 ```
-storage_node_daemon
-├── src
-│   ├── main.rs          # Entry point of the application
-│   ├── config.rs        # Configuration handling
-│   ├── storage.rs       # Storage management functions
-│   ├── network.rs       # WebSocket connection management
-│   ├── commands.rs      # Command handling logic
-│   └── lib.rs           # Library module for shared types/functions
-├── config
-│   └── config.toml      # Configuration settings
-├── systemd
-│   └── storage_node_daemon.service # Systemd service configuration
-├── scripts
-│   └── install.sh       # Installation script
-├── Cargo.toml           # Cargo configuration file
-├── Cargo.lock           # Dependency lock file
-├── README.md            # Project documentation
-└── .gitignore           # Git ignore file
+storage_client/
+├── src/
+│   ├── main.rs          # Entry point and CLI handling
+│   ├── cli.rs           # Command-line interface
+│   ├── config.rs        # Configuration management
+│   ├── storage.rs       # Storage operations
+│   ├── network.rs       # WebSocket communication
+│   └── commands.rs      # Backend command handling
+├── scripts/
+│   ├── install.sh       # Automated installer
+│   ├── uninstall.sh     # Uninstaller script
+│   └── README.md        # Scripts documentation
+├── Cargo.toml           # Rust dependencies
+└── README.md            # This file
 ```
-
-## Setup Instructions
-
-1. **Clone the Repository**:
-
-    ```
-    git clone https://github.com/your-repo/storage_node_daemon.git
-    cd storage_node_daemon
-    ```
-
-2. **Build the Project**:
-
-    ```
-    cargo build --release
-    ```
-
-3. **Configure the Daemon**:
-   Edit the `config/config.toml` file to set your node ID, authentication token, backend URLs, storage path, and limits.
-
-4. **Install the Daemon**:
-   Run the installation script to set up the service:
-
-    ```
-    ./scripts/install.sh
-    ```
-
-5. **Start the Service**:
-   Enable and start the service using systemd:
-    ```
-    sudo systemctl enable storage_node_daemon
-    sudo systemctl start storage_node_daemon
-    ```
-
-## Usage
-
-The Storage Node Daemon will automatically register with the backend and start listening for commands. It will handle storage operations such as storing, retrieving, and deleting encrypted data chunks as instructed by the backend.
-
-## Logging
-
-Logs are generated based on the configured log level in `config/config.toml`. Ensure to check the logs for any issues or operational messages.
-
-## Security Considerations
-
--   Ensure that the configuration file has restrictive permissions.
--   Use secure URLs for backend communication.
--   Regularly monitor disk usage and health status.
 
 ## Contributing
 
-Contributions are welcome! Please submit a pull request or open an issue for any enhancements or bug fixes.
-
-## License
-
-This project is licensed under the MIT License. See the LICENSE file for details.
+Contributions are welcome! Please submit a pull request or open an issue for enhancements or bug fixes.

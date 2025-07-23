@@ -1,5 +1,5 @@
 [package]
-name = "Project_YourCloud_Client"
+name = "yourcloud_client"
 version = "0.1.0"
 edition = "2021"
 
@@ -15,9 +15,13 @@ log = "0.4"
 env_logger = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
 sysinfo = "0.30"
-tokio-tungstenite = { version = "0.21", features = ["native-tls", "tokio-native-tls"] }
+tokio-tungstenite = { version = "0.21", features = [
+    "native-tls",
+    "tokio-native-tls",
+] }
 bytes = "1"
 futures-util = "0.3"
 tokio-util = "0.7.15"
 native-tls = "0.2"
 base64 = "0.21"
+clap = { version = "4.0", features = ["derive"] }

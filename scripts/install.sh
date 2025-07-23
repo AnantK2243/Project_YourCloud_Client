@@ -59,7 +59,7 @@ if ! cargo build --release; then
     exit 1
 fi
 
-BINARY_PATH="target/release/Project_YourCloud_Client"
+BINARY_PATH="target/release/yourcloud_client"
 if [ ! -f "$BINARY_PATH" ]; then
     print_error "Binary not found at $BINARY_PATH after build."
     exit 1
@@ -68,58 +68,17 @@ fi
 print_success "Binary built successfully!"
 
 # Step 2: Install binary
-print_info "Installing binary to /usr/local/bin/Project_YourCloud_Client..."
-sudo cp "$BINARY_PATH" /usr/local/bin/Project_YourCloud_Client
-sudo chmod 755 /usr/local/bin/Project_YourCloud_Client
+print_info "Installing binary to /usr/local/bin/yourcloud_client..."
+sudo cp "$BINARY_PATH" /usr/local/bin/yourcloud_client
+sudo chmod 755 /usr/local/bin/yourcloud_client
 print_success "Binary installed successfully!"
 
-# Step 3: Collect configuration from user
-echo ""
-print_info "Configuration Setup"
-echo "==================="
+# Step 3: Run setup
 
-# Get Node ID
-while true; do
-    read -p "Enter your Node ID (from dashboard): " NODE_ID
-    if validate_required "$NODE_ID" "Node ID"; then
-        break
-    fi
-done
+print_info "Running setup..."
+yourcloud_client setup
 
-# Get Auth Token
-while true; do
-    read -p "Enter your Auth Token (from dashboard): " AUTH_TOKEN
-    if validate_required "$AUTH_TOKEN" "Auth Token"; then
-        break
-    fi
-done
-
-# Get Storage Path
-DEFAULT_STORAGE_PATH="$HOME/Project_YourCloud"
-prompt_with_default "Enter storage directory path" "$DEFAULT_STORAGE_PATH" STORAGE_PATH
-
-# Get Storage Size
-prompt_with_default "Enter maximum storage size (GiB)" "40" MAX_STORAGE_GB
-
-
-# Step 4: Create configuration file
-CONFIG_DIR="$HOME/.config/Project_YourCloud"
-CONFIG_PATH="$CONFIG_DIR/config.toml"
-
-print_info "Creating configuration file at $CONFIG_PATH..."
-mkdir -p "$CONFIG_DIR"
-
-cat > "$CONFIG_PATH" << EOF
-node_id = "$NODE_ID"
-auth_token = "$AUTH_TOKEN"
-storage_path = "$STORAGE_PATH"
-max_storage_gib = $MAX_STORAGE_GB
-EOF
-
-chmod 600 "$CONFIG_PATH"
-print_success "Configuration file created!"
-
-# Step 5: Ask about systemd setup
+# Step 4: Ask about systemd setup
 echo ""
 print_info "Service Setup"
 echo "============="
@@ -128,7 +87,7 @@ SETUP_SYSTEMD=${SETUP_SYSTEMD:-y}
 
 if [[ "$SETUP_SYSTEMD" =~ ^[Yy]$ ]]; then
     # Create systemd service file
-    SYSTEMD_SERVICE_PATH="/etc/systemd/system/project-yourcloud-storage.service"
+    SYSTEMD_SERVICE_PATH="/etc/systemd/system/yourcloud-storage.service"
     
     print_info "Creating systemd service..."
     sudo tee "$SYSTEMD_SERVICE_PATH" > /dev/null << EOF
@@ -143,7 +102,7 @@ User=$USER
 Group=$USER
 WorkingDirectory=$HOME
 Environment=HOME=$HOME
-ExecStart=/usr/local/bin/Project_YourCloud_Client
+ExecStart=/usr/local/bin/yourcloud_client start
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=10
@@ -156,7 +115,7 @@ EOF
 
     # Reload systemd and enable service
     sudo systemctl daemon-reload
-    sudo systemctl enable project-yourcloud-storage.service
+    sudo systemctl enable yourcloud-storage.service
     
     print_success "Systemd service created and enabled!"
     
@@ -165,35 +124,52 @@ EOF
     START_NOW=${START_NOW:-y}
     
     if [[ "$START_NOW" =~ ^[Yy]$ ]]; then
-        sudo systemctl start project-yourcloud-storage.service
+        sudo systemctl start yourcloud-storage.service
         print_success "Service started!"
-        print_info "You can check the service status with: sudo systemctl status project-yourcloud-storage"
-        print_info "View logs with: sudo journalctl -u project-yourcloud-storage -f"
+        print_info "You can check the service status with: sudo systemctl status yourcloud-storage"
+        print_info "View logs with: sudo journalctl -u yourcloud-storage -f"
     else
-        print_info "You can start the service later with: sudo systemctl start project-yourcloud-storage"
+        print_info "You can start the service later with: sudo systemctl start yourcloud-storage"
     fi
 else
     print_info "Systemd service not configured. You can run the storage node manually."
 fi
 
-# Step 6: Display final information
-echo ""
+# Step 5: Final messages
 print_success "Installation completed successfully!"
 echo "===================================="
 echo ""
-print_info "Configuration file: $CONFIG_PATH"
-print_info "Storage directory: $STORAGE_PATH"
-print_info "Binary location: /usr/local/bin/Project_YourCloud_Client"
+print_info "Binary location: /usr/local/bin/yourcloud_client"
+echo ""
+
+print_info "Available Commands:"
+echo "  yourcloud_client start     - Start the storage node daemon"
+echo "  yourcloud_client status    - Display current storage node status and configuration"
+echo "  yourcloud_client setup     - Interactive setup to configure the storage node"
+echo "  yourcloud_client validate  - Validate the current configuration"
+echo "  yourcloud_client config    - Show configuration file path and contents"
+echo "  yourcloud_client --help    - Display help information"
 echo ""
 
 if [[ "$SETUP_SYSTEMD" =~ ^[Yy]$ ]]; then
     print_info "Systemd Commands:"
-    echo "  Start service:   sudo systemctl start project-yourcloud-storage"
-    echo "  Stop service:    sudo systemctl stop project-yourcloud-storage"
-    echo "  Restart service: sudo systemctl restart project-yourcloud-storage"
-    echo "  Check status:    sudo systemctl status project-yourcloud-storage"
-    echo "  View logs:       sudo journalctl -u project-yourcloud-storage -f"
+    echo "  Start service:   sudo systemctl start yourcloud-storage"
+    echo "  Stop service:    sudo systemctl stop yourcloud-storage"
+    echo "  Restart service: sudo systemctl restart yourcloud-storage"
+    echo "  Check status:    sudo systemctl status yourcloud-storage"
+    echo "  View logs:       sudo journalctl -u yourcloud-storage -f"
+    echo ""
+    print_info "Manual Commands:"
+    echo "  Start manually:  yourcloud_client start"
+    echo "  Check status:    yourcloud_client status"
+    echo "  Reconfigure:     yourcloud_client setup"
 fi
 
 echo ""
 print_info "Your storage node is ready! Check your dashboard to verify the connection."
+echo ""
+print_info "Additional Information:"
+echo "  - To uninstall: ./scripts/uninstall.sh"
+echo "  - To reconfigure: yourcloud_client setup"
+echo "  - For help: yourcloud_client --help"
+echo "  - View status: yourcloud_client status"

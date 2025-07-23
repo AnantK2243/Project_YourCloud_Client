@@ -1,21 +1,22 @@
 // src/main.rs
 
 use anyhow::{anyhow, Context, Result};
+use clap::Parser;
 use log::{error, info};
 use tokio::fs;
 use tokio::signal;
 
 // Backend WebSocket URL configuration
-const WS_URL: &str = "wss://wss.project-yourcloud.me";
-// const WS_URL: &str = "wss://localhost:4200";
-
+const DEFAULT_WS_URL: &str = "wss://wss.project-yourcloud.me";
 // Declare modules
+mod cli;
 mod commands;
 mod config;
 mod network;
 mod storage;
 
-use crate::config::load_config;
+use crate::cli::{handle_command, Cli};
+use crate::config::{load_config, make_storage_directory};
 use crate::network::start_communication_loop;
 use crate::storage::get_disk_available_space;
 use crate::storage::initialize_storage_state;
@@ -27,10 +28,26 @@ async fn main() -> Result<()> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
+    // Parse command line arguments
+    let cli = Cli::parse();
+
+    // Handle non-start commands (these exit after completion)
+    if !matches!(cli.command, crate::cli::Commands::Start) {
+        return handle_command(cli).await;
+    }
+
+    // Continue with start command (normal daemon startup)
+    start_daemon().await
+}
+
+async fn start_daemon() -> Result<()> {
     info!("Starting storage client");
 
     // Get user config
     let config = load_config().await?;
+
+    make_storage_directory(Some(config.storage_path.clone()))
+        .with_context(|| format!("Failed to create storage directory: {:?}", config.storage_path))?;
 
     info!("Configuration loaded successfully");
 
@@ -78,11 +95,17 @@ async fn main() -> Result<()> {
         chunk_count.load(std::sync::atomic::Ordering::Relaxed)
     );
 
-    // Start the communication loop (includes registration if needed)
+    let ws_url = if config.ws_url.is_empty() {
+        DEFAULT_WS_URL.to_string()
+    } else {
+        config.ws_url.clone()
+    };
+
+    // Start the communication loop
     info!("Starting communication loop...");
     let comm_loop = start_communication_loop(
         config.clone(),
-        WS_URL.to_string(),
+        ws_url,
         used_space_bytes,
         max_storage_bytes,
         chunk_count,
