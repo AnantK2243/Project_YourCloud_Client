@@ -218,7 +218,7 @@ else
         
         if [ "$file_count" -gt 0 ]; then
             print_warning "Default storage directory contains $file_count files ($(format_size $total_size))."
-            print_warning "⚠️  WARNING: This will permanently delete all stored data! ⚠️"
+            print_warning "WARNING: This will permanently delete all stored data!"
             
             if confirm "Delete default storage directory and ALL stored data?" "n"; then
                 rm -rf "$DEFAULT_STORAGE"
