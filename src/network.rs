@@ -490,7 +490,7 @@ pub async fn start_communication_loop(
     // Ensure backend_ws_url has a scheme, but allow WS for local development
     let ws_url = if !ws_url.starts_with("ws://") && !ws_url.starts_with("wss://") {
         warn!("Configured backend_ws_url does not specify a scheme. Assuming WS for local development: {}", ws_url);
-        format!("ws://{}", ws_url)
+        format!("wss://{}", ws_url)
     } else {
         ws_url
     };
