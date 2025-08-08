@@ -33,22 +33,6 @@ pub async fn load_config() -> Result<Config> {
     let config_path = get_config_path()?;
     info!("Attempting to load configuration from: {:?}", config_path);
 
-    // TODO: REMOVE, NOW HANDLED MANUALLY
-    // First time run, create default config file at path
-    // if !config_path.exists() {
-    //     warn!(
-    //         "Config file not found, creating default at: {:?}",
-    //         config_path
-    //     );
-    //     let default_config = Config::default();
-    //     save_config(&default_config).await?;
-
-    //     // Display warning and stop the program
-    //     info!("DEFAULT CONFIGURATION CREATED, PLEASE RUN WITH SETUP COMMAND TO CONFIGURE");
-
-    //     return Err(anyhow!("Default configuration created. Please configure node_id and auth_token before running again."));
-    // }
-
     if !config_path.exists() {
         info!("Configuration file does not exist, please run the setup command to configure");
         return Err(anyhow!(
@@ -56,7 +40,6 @@ pub async fn load_config() -> Result<Config> {
         ));
     }
 
-    // Read and return
     let config_content = fs::read_to_string(&config_path)
         .await
         .context("Failed to read config file")?;
